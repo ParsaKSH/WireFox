@@ -1,0 +1,31 @@
+# Setup:
+#   useradd --system --no-create-home --shell /usr/sbin/nologin wirefox
+#   install -D -m 640 -o root -g wirefox node.toml /etc/wirefox/node.toml
+#   cp wirefox-node.service /etc/systemd/system/ && systemctl enable --now wirefox-node
+
+[Unit]
+Description=WireFox exit-node
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+ExecStart=/usr/local/bin/wirefox-node run -c /etc/wirefox/node.toml
+User=wirefox
+Group=wirefox
+Restart=always
+RestartSec=2
+LimitNOFILE=1048576
+
+# Binding to an interface by name works unprivileged on Linux 5.7 and newer.
+# On older kernels it needs CAP_NET_RAW: replace the empty
+# CapabilityBoundingSet= below with the two commented lines.
+CapabilityBoundingSet=
+#CapabilityBoundingSet=CAP_NET_RAW
+#AmbientCapabilities=CAP_NET_RAW
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+
+[Install]
+WantedBy=multi-user.target

@@ -1,0 +1,22 @@
+# The first four values come from the server: create the node with
+# `POST /api/v1/nodes` and copy the `node_config` field of the response.
+server = "relay.example.com:7443"
+server_fingerprint = "<SHA-256 printed by wirefox-server>"
+node_id = "node-1"
+token = "<token from the server>"
+
+# pool_size = 16              # idle tunnel connections kept ready for new streams
+# max_extra = 1024            # extra connections opened on demand during bursts
+# connect_timeout_secs = 10
+# allow_local = false         # allow proxying to this machine and link-local addresses
+
+# Where proxied traffic leaves. Pick an interface, a source address, or both.
+# `wirefox-node interfaces` lists the names; on Windows use the name it shows
+# (e.g. "Ethernet 2") or the adapter GUID.
+[egress]
+# interface = "eth1"
+# source_ip = "192.168.50.10"
+
+# How to reach the server. Defaults to the normal routing table.
+[uplink]
+# interface = "eth0"

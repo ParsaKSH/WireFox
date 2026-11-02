@@ -1,0 +1,130 @@
+name: Build
+
+on:
+  push:
+    branches: [main]
+    tags: ["v*"]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: build-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+  ZIG_VERSION: 0.14.1
+
+jobs:
+  ci:
+    name: CI
+    if: startsWith(github.ref, 'refs/tags/v')
+    uses: ./.github/workflows/ci.yml
+
+  build:
+    name: ${{ matrix.name }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: linux-amd64
+            os: ubuntu-latest
+            target: x86_64-unknown-linux-musl
+          - name: linux-arm64
+            os: ubuntu-latest
+            target: aarch64-unknown-linux-musl
+          # OpenWrt arch name; cortex-a7 implies NEON and VFPv4.
+          - name: linux-arm_cortex-a7_neon-vfpv4
+            os: ubuntu-latest
+            target: armv7-unknown-linux-musleabihf
+            rustflags: -C target-cpu=cortex-a7
+          # Static CRT: runs without the Visual C++ redistributable.
+          - name: windows-amd64
+            os: windows-latest
+            target: x86_64-pc-windows-msvc
+            rustflags: -C target-feature=+crt-static
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.target }}
+
+      # Linux builds are static musl binaries, cross-compiled with zig as the C toolchain
+      # (ring and mimalloc have C code).
+      - name: Install zig
+        if: runner.os == 'Linux'
+        uses: mlugg/setup-zig@v2
+        with:
+          version: ${{ env.ZIG_VERSION }}
+
+      - name: Install cargo-zigbuild
+        if: runner.os == 'Linux'
+        uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-zigbuild
+
+      - name: Build (Linux)
+        if: runner.os == 'Linux'
+        env:
+          RUSTFLAGS: ${{ matrix.rustflags }}
+        run: cargo zigbuild --release --locked --target ${{ matrix.target }} -p wirefox-server -p wirefox-node
+
+      - name: Build (Windows)
+        if: runner.os == 'Windows'
+        env:
+          RUSTFLAGS: ${{ matrix.rustflags }}
+        run: cargo build --release --locked --target ${{ matrix.target }} -p wirefox-server -p wirefox-node
+
+      - name: Package
+        shell: bash
+        run: |
+          name="wirefox-${GITHUB_REF_NAME//\//-}-${{ matrix.name }}"
+          mkdir -p "dist/$name"
+          bin="target/${{ matrix.target }}/release"
+          if [ "$RUNNER_OS" = "Windows" ]; then ext=".exe"; else ext=""; fi
+          cp "$bin/wirefox-server$ext" "$bin/wirefox-node$ext" examples/node.toml LICENSE "dist/$name/"
+          cd dist
+          if [ "$RUNNER_OS" = "Windows" ]; then
+            7z a -tzip "$name.zip" "$name" > /dev/null
+          else
+            tar -czf "$name.tar.gz" "$name"
+          fi
+          rm -rf "$name"
+          ls -l
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: wirefox-${{ matrix.name }}
+          path: dist/*
+          if-no-files-found: error
+
+  release:
+    name: Release
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: [ci, build]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+
+      - name: Checksums
+        working-directory: dist
+        run: sha256sum * > SHA256SUMS
+
+      - uses: softprops/action-gh-release@v2
+        with:
+          files: dist/*
+          generate_release_notes: true
