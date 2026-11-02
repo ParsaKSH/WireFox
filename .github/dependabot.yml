@@ -11,3 +11,7 @@ updates:
     groups:
       cargo:
         patterns: ["*"]
+    ignore:
+      # 0.13 needs Rust 1.95, above our MSRV (1.88).
+      - dependency-name: parking_lot
+        versions: [">= 0.13"]

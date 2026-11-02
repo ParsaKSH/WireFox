@@ -19,7 +19,7 @@ pub fn init_tracing(default_level: &str) {
 
 /// Random hex token made of `bytes` bytes from the OS CSPRNG.
 pub fn random_token(bytes: usize) -> String {
-    use rand::RngCore;
+    use rand::Rng;
     let mut buf = vec![0u8; bytes];
     rand::rng().fill_bytes(&mut buf);
     hex::encode(buf)

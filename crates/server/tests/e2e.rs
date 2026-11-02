@@ -4,7 +4,7 @@ use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::time::Duration;
 
-use argon2::password_hash::{PasswordHasher, SaltString};
+use argon2::password_hash::PasswordHasher;
 use serde_json::{json, Value};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
@@ -28,8 +28,7 @@ impl Drop for Fixture {
 async fn start_server() -> Fixture {
     let dir = std::env::temp_dir().join(format!("wirefox-e2e-{}", wirefox_common::random_token(8)));
     std::fs::create_dir_all(&dir).unwrap();
-    let salt = SaltString::encode_b64(b"0123456789abcdef").unwrap();
-    let admin_hash = argon2::Argon2::default().hash_password(ADMIN_PASSWORD.as_bytes(), &salt).unwrap().to_string();
+    let admin_hash = argon2::Argon2::default().hash_password(ADMIN_PASSWORD.as_bytes()).unwrap().to_string();
     let config = format!(
         r#"
         data_dir = "data"

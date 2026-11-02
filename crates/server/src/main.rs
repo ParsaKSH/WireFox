@@ -2,7 +2,7 @@ use std::io::{BufRead, IsTerminal};
 use std::path::PathBuf;
 
 use anyhow::{bail, Context, Result};
-use argon2::password_hash::{PasswordHasher, SaltString};
+use argon2::password_hash::PasswordHasher;
 use clap::{Parser, Subcommand};
 use tracing::info;
 use wirefox_server::config::ServerConfig;
@@ -90,10 +90,8 @@ fn hash_password(password: &str) -> Result<String> {
     if password.is_empty() {
         bail!("the password is empty");
     }
-    let salt_bytes: [u8; 16] = rand::random();
-    let salt = SaltString::encode_b64(&salt_bytes).map_err(|e| anyhow::anyhow!("encoding salt: {e}"))?;
     argon2::Argon2::default()
-        .hash_password(password.as_bytes(), &salt)
+        .hash_password(password.as_bytes())
         .map(|h| h.to_string())
         .map_err(|e| anyhow::anyhow!("hashing password: {e}"))
 }

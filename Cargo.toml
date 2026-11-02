@@ -30,7 +30,7 @@ subtle = "2"
 clap = { version = "4", features = ["derive"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
-parking_lot = "0.13"
+parking_lot = "0.12"
 mimalloc = { version = "0.1", default-features = false }
 
 [profile.release]
