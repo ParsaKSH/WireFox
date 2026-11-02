@@ -101,7 +101,7 @@ jobs:
           rm -rf "$name"
           ls -l
 
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         with:
           name: wirefox-${{ matrix.name }}
           path: dist/*
