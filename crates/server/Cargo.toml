@@ -27,8 +27,8 @@ axum = { version = "0.8", default-features = false, features = ["json", "query",
 hyper = { version = "1", features = ["server", "http1"] }
 hyper-util = { version = "0.1", features = ["tokio"] }
 tower = { version = "0.5", features = ["util"] }
-tower-http = { version = "0.6", features = ["cors", "timeout"] }
-argon2 = "0.5"
+tower-http = { version = "0.7", features = ["cors", "timeout"] }
+argon2 = "0.6"
 rpassword = "7"
 
 [features]
