@@ -5,6 +5,7 @@ pub mod api;
 pub mod balance;
 pub mod config;
 pub mod limiter;
+pub mod settings;
 pub mod socks;
 pub mod state;
 pub mod tunnel;
@@ -20,11 +21,13 @@ use wirefox_common::net::bind_listener;
 
 use crate::config::ServerConfig;
 use crate::limiter::SocksAuthLimiter;
+use crate::settings::LiveSettings;
 use crate::state::Store;
 
 /// A running server. The listeners live on in background tasks.
 pub struct Server {
     pub store: Arc<Store>,
+    pub settings: Arc<LiveSettings>,
     pub fingerprint: String,
     pub tunnel_addr: SocketAddr,
     pub socks_addrs: Vec<SocketAddr>,
@@ -40,6 +43,7 @@ pub async fn start(cfg: ServerConfig) -> Result<Server> {
     let tunnel_tls = TlsAcceptor::from(wirefox_common::tls::server_config(&cert, true)?);
     let public_tls = TlsAcceptor::from(wirefox_common::tls::server_config(&cert, false)?);
     let store = Store::load(cfg.state_path())?;
+    let settings = Arc::new(LiveSettings::new(cfg.socks.settings()));
 
     let bind = |addr: SocketAddr, what: &str| {
         let listener = bind_listener(addr).with_context(|| format!("binding {what} listener on {addr}"))?;
@@ -54,9 +58,7 @@ pub async fn start(cfg: ServerConfig) -> Result<Server> {
     let socks_ctx = socks::SocksCtx {
         store: store.clone(),
         limiter: Arc::new(SocksAuthLimiter::new(Duration::from_secs(300))),
-        balance: cfg.socks.balance,
-        handshake_timeout: Duration::from_secs(cfg.socks.handshake_timeout_secs),
-        connect_timeout: Duration::from_secs(cfg.socks.connect_timeout_secs),
+        settings: settings.clone(),
     };
     let mut socks_addrs = Vec::new();
     for &addr in &cfg.socks.listen {
@@ -80,11 +82,11 @@ pub async fn start(cfg: ServerConfig) -> Result<Server> {
         None => tunnel_addr.to_string(),
     };
     let api_state =
-        api::ApiState::new(store.clone(), cfg.api.clone(), fingerprint.clone(), public_tunnel_addr, cfg.socks.balance)?;
+        api::ApiState::new(store.clone(), settings.clone(), cfg.api.clone(), fingerprint.clone(), public_tunnel_addr)?;
     let app = api::router(api_state)?;
     let (listener, api_addr) = bind(cfg.api.listen, "api")?;
     tokio::spawn(api::serve(listener, cfg.api.tls.then(|| public_tls.clone()), app));
 
     tokio::spawn(store.clone().autosave());
-    Ok(Server { store, fingerprint, tunnel_addr, socks_addrs, socks_tls_addrs, api_addr })
+    Ok(Server { store, settings, fingerprint, tunnel_addr, socks_addrs, socks_tls_addrs, api_addr })
 }

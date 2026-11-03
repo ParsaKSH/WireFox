@@ -5,6 +5,7 @@
 mod auth;
 mod conns;
 mod nodes;
+mod settings;
 mod users;
 
 use std::collections::HashMap;
@@ -31,9 +32,9 @@ use tower::ServiceExt;
 use tracing::debug;
 use wirefox_common::net::accept;
 
-use crate::balance::Strategy;
 use crate::config::ApiSection;
 use crate::limiter::{client_key, FailureLimiter};
+use crate::settings::LiveSettings;
 use crate::state::Store;
 
 const MAX_CONNECTIONS: usize = 256;
@@ -47,12 +48,11 @@ const CONCURRENT_LOGINS: usize = 2;
 
 pub struct ApiState {
     pub store: Arc<Store>,
+    pub settings: Arc<LiveSettings>,
     pub cfg: ApiSection,
     pub fingerprint: String,
     /// Tunnel address (`host:port`) to put in generated node configs.
     pub public_tunnel_addr: String,
-    /// Node selection for users without their own `balance`.
-    pub default_balance: Strategy,
     pub started: Instant,
     /// SHA-256 of session token -> expiry.
     sessions: Mutex<HashMap<[u8; 32], Instant>>,
@@ -64,10 +64,10 @@ pub struct ApiState {
 impl ApiState {
     pub fn new(
         store: Arc<Store>,
+        settings: Arc<LiveSettings>,
         cfg: ApiSection,
         fingerprint: String,
         public_tunnel_addr: String,
-        default_balance: Strategy,
     ) -> anyhow::Result<Arc<Self>> {
         let api_keys = cfg
             .api_key_hashes
@@ -77,14 +77,20 @@ impl ApiState {
                 bytes.try_into().map_err(|_| anyhow::anyhow!("API key hashes must be 64 hex characters"))
             })
             .collect::<anyhow::Result<Vec<[u8; 32]>>>()?;
-        PasswordHash::new(&cfg.admin_password_hash)
-            .map_err(|e| anyhow::anyhow!("api.admin_password_hash is not a valid Argon2 hash: {e}"))?;
+        match (&cfg.admin_username, &cfg.admin_password_hash) {
+            (Some(_), Some(hash)) => {
+                PasswordHash::new(hash)
+                    .map_err(|e| anyhow::anyhow!("api.admin_password_hash is not a valid Argon2 hash: {e}"))?;
+            }
+            (None, None) => {}
+            _ => anyhow::bail!("api.admin_username and api.admin_password_hash must be set together"),
+        }
         Ok(Arc::new(ApiState {
             store,
+            settings,
             cfg,
             fingerprint,
             public_tunnel_addr,
-            default_balance,
             started: Instant::now(),
             sessions: Mutex::new(HashMap::new()),
             api_keys,
@@ -151,6 +157,7 @@ pub fn router(st: Arc<ApiState>) -> anyhow::Result<Router> {
         .route("/users/{name}/reset-traffic", post(users::reset_traffic))
         .route("/connections", get(conns::list))
         .route("/connections/{id}", delete(conns::kill))
+        .route("/settings", get(settings::get).patch(settings::update))
         .route_layer(middleware::from_fn_with_state(st.clone(), require_auth));
     let public = Router::new()
         .route("/auth/login", post(auth::login))
@@ -185,7 +192,7 @@ async fn status(State(st): State<Arc<ApiState>>) -> ApiResult<serde_json::Value>
         "version": wirefox_common::VERSION,
         "uptime_secs": st.started.elapsed().as_secs(),
         "tunnel_fingerprint": st.fingerprint,
-        "default_balance": st.default_balance,
+        "default_balance": st.settings.get().balance,
         "nodes_total": nodes_total,
         "nodes_online": nodes_online,
         "users_total": store.users.read().len(),
