@@ -25,6 +25,9 @@ pub async fn login(
     ConnectInfo(peer): ConnectInfo<SocketAddr>,
     Json(body): Json<LoginRequest>,
 ) -> ApiResult<serde_json::Value> {
+    let Some((admin_username, admin_password_hash)) = st.cfg.admin() else {
+        return Err(error(StatusCode::NOT_FOUND, "admin login is disabled"));
+    };
     let ip = peer.ip();
     let client = client_key(peer.ip());
     if st.login_failures.is_blocked(&client) {
@@ -37,7 +40,7 @@ pub async fn login(
     st.login_failures.record_failure(client);
 
     // Always run the slow hash, so a wrong username takes as long as a wrong password.
-    let hash = st.cfg.admin_password_hash.clone();
+    let hash = admin_password_hash.to_string();
     let password = body.password;
     let password_ok = tokio::task::spawn_blocking(move || {
         // Held until the hash is done, even if the client hangs up meanwhile.
@@ -46,7 +49,7 @@ pub async fn login(
     })
     .await
     .unwrap_or(false);
-    let username_ok = wirefox_common::ct_eq(body.username.as_bytes(), st.cfg.admin_username.as_bytes());
+    let username_ok = wirefox_common::ct_eq(body.username.as_bytes(), admin_username.as_bytes());
     if !(password_ok && username_ok) {
         warn!(%ip, "failed API login");
         return Err(error(StatusCode::UNAUTHORIZED, "invalid credentials"));
