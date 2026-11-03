@@ -53,21 +53,22 @@ WantedBy=multi-user.target`,
 }
 
 export function windowsScript(key: string): string {
-  return `# Run in an elevated PowerShell; wirefox-node.exe is in C:\\WireFox
-# The key is kept in a machine environment variable. setx only reaches new
-# processes, so this window gets it too for the foreground test.
-setx /M WIREFOX_NODE_KEY '${key}'
-$env:WIREFOX_NODE_KEY = '${key}'
+  return `# Run in an elevated PowerShell; wirefox-node.exe is in C:\\WireFox.
+# The key goes in a file only SYSTEM and Administrators can read (a machine
+# environment variable would be readable by every local user).
+icacls C:\\WireFox /inheritance:r /grant:r '*S-1-5-18:(OI)(CI)F' '*S-1-5-32-544:(OI)(CI)F'
+Set-Content -Path 'C:\\WireFox\\node.key' -Value '${key}' -NoNewline
 
 # Optional: try it in the foreground first (Ctrl+C to stop)
-& 'C:\\WireFox\\wirefox-node.exe' run
+& 'C:\\WireFox\\wirefox-node.exe' run --key-file 'C:\\WireFox\\node.key'
 
 # Start it at boot as SYSTEM, restarting it if it ever exits; its saved
 # settings go to %ProgramData%\\wirefox-node
-$action = New-ScheduledTaskAction -Execute 'C:\\WireFox\\wirefox-node.exe' -Argument 'run' -WorkingDirectory 'C:\\WireFox'
+$action = New-ScheduledTaskAction -Execute 'C:\\WireFox\\wirefox-node.exe' -Argument 'run --key-file C:\\WireFox\\node.key' -WorkingDirectory 'C:\\WireFox'
 $trigger = New-ScheduledTaskTrigger -AtStartup
 $settings = New-ScheduledTaskSettingsSet -ExecutionTimeLimit ([TimeSpan]::Zero) -RestartCount 999 -RestartInterval (New-TimeSpan -Minutes 1)
-Register-ScheduledTask -TaskName 'WireFox node' -Action $action -Trigger $trigger -Settings $settings -User 'SYSTEM' -RunLevel Highest
+$principal = New-ScheduledTaskPrincipal -UserId 'SYSTEM' -LogonType ServiceAccount -RunLevel Highest
+Register-ScheduledTask -TaskName 'WireFox node' -Action $action -Trigger $trigger -Settings $settings -Principal $principal
 Start-ScheduledTask -TaskName 'WireFox node'`;
 }
 
@@ -86,7 +87,7 @@ USE_PROCD=1
 start_service() {
 	procd_open_instance
 	procd_set_param command /usr/bin/wirefox-node run --state-dir /etc/wirefox-node
-	procd_set_param env WIREFOX_NODE_KEY="$(cat /etc/wirefox/node.key)"
+	procd_set_param env WIREFOX_NODE_KEY_FILE=/etc/wirefox/node.key
 	procd_set_param respawn 3600 5 0
 	procd_set_param stdout 1
 	procd_set_param stderr 1
@@ -109,6 +110,16 @@ function Snippet({ title, code }: { title: string; code: string }) {
     </div>
   );
 }
+
+const SCRIPTS = "https://raw.githubusercontent.com/ParsaKSH/WireFox/main/scripts";
+
+// The installers download the release, check its checksum, set up the service
+// and ask for the key, so it never lands in the shell history.
+export const QUICK_INSTALL: Record<Platform, string> = {
+  linux: `sh -c "$(curl -fsSL ${SCRIPTS}/install-node.sh)"`,
+  windows: `irm ${SCRIPTS}/install-node.bat -OutFile install-node.bat; .\\install-node.bat`,
+  openwrt: `sh -c "$(wget -qO- ${SCRIPTS}/install-node.sh)"`,
+};
 
 const TABS: { id: Platform; label: string }[] = [
   { id: "linux", label: "Linux" },
@@ -167,9 +178,7 @@ export function NodeKeyModal({ nodeId, nodeKey, onClose }: { nodeId: string; nod
             {nodeKey}
           </code>
           <p className="mt-1.5 text-xs text-slate-500">
-            Install the <span className="font-mono">wirefox-node</span> binary on the exit-node and start{" "}
-            <span className="font-mono text-slate-300">wirefox-node run</span> with the key in the{" "}
-            <span className="font-mono text-slate-300">WIREFOX_NODE_KEY</span> environment variable, as below. It
+            Run the installer on the exit-node and paste the key when it asks, or set it up by hand as below. The node
             connects to this panel, receives its tunnel settings and keeps working from its saved settings when the
             panel is away.
           </p>
@@ -201,6 +210,15 @@ export function NodeKeyModal({ nodeId, nodeKey, onClose }: { nodeId: string; nod
             ))}
           </div>
           <div className="space-y-4" id={`${tabsId}-panel`} role="tabpanel" aria-labelledby={`${tabsId}-${platform}`}>
+            <Snippet
+              title={
+                platform === "windows"
+                  ? "Quick install: PowerShell as Administrator, then paste the key when asked"
+                  : "Quick install: as root, then paste the key when asked"
+              }
+              code={QUICK_INSTALL[platform]}
+            />
+            <p className="text-xs font-medium uppercase tracking-wide text-slate-500">Or by hand</p>
             {platform === "linux" && (
               <>
                 <Snippet title="1. Create the service user and store the key (as root)" code={linux.shell} />
