@@ -4,6 +4,8 @@ use std::path::{Path, PathBuf};
 use anyhow::{Context, Result};
 use serde::Deserialize;
 
+use crate::balance::Strategy;
+
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ServerConfig {
@@ -53,6 +55,10 @@ pub struct SocksSection {
     /// How long a request may wait for a tunnel connection plus the node's dial.
     #[serde(default = "default_connect_timeout")]
     pub connect_timeout_secs: u64,
+    /// How connections are spread over nodes: `round-robin`, `least-ping`,
+    /// `least-load` or `random`. Users can override it through the API.
+    #[serde(default)]
+    pub balance: Strategy,
 }
 
 #[derive(Debug, Clone, Deserialize)]

@@ -1650,6 +1650,7 @@ dependencies = [
  "hyper-util",
  "mimalloc",
  "parking_lot",
+ "rand",
  "rpassword",
  "serde",
  "serde_json",

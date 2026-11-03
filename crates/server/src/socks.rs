@@ -17,6 +17,7 @@ use tracing::{debug, warn};
 use wirefox_common::net::{accept, relay, tune_tcp};
 use wirefox_common::proto::{self, read_short_string, rep, Target};
 
+use crate::balance::{Candidate, Strategy};
 use crate::limiter::SocksAuthLimiter;
 use crate::state::{ConnEntry, Store, Traffic, UserEntry};
 use crate::tunnel::{NodeSession, TunnelConn};
@@ -35,6 +36,8 @@ const STALE_RETRIES: usize = 3;
 pub struct SocksCtx {
     pub store: Arc<Store>,
     pub limiter: Arc<SocksAuthLimiter>,
+    /// Default node selection; users may override it.
+    pub balance: Strategy,
     pub handshake_timeout: Duration,
     pub connect_timeout: Duration,
 }
@@ -86,11 +89,13 @@ where
     };
 
     let deadline = Instant::now() + ctx.connect_timeout;
+    let mut tried = Vec::new();
     loop {
-        let Some((node, session)) = ctx.store.pick_node(&user) else {
+        let Some(Candidate { node, session }) = ctx.store.pick_node(&user, ctx.balance, &tried) else {
             reply_error(&mut client, rep::NETWORK_UNREACHABLE).await;
             return Err(io::Error::other(format!("no node online for user {}", user.username)));
         };
+        tried.push(node.id.clone());
         // Register first and check second: an admin disabling the user or node
         // either sees this connection in the registry or we see their change.
         let conn = ctx.store.register_conn(&user.username, &node.id, target.to_string(), peer);
@@ -109,6 +114,7 @@ where
         };
         let (mut data, bound) = match opened {
             Ok(x) => x,
+            // The node went away mid-request: try another one.
             Err(ConnectError::SessionGone) if Instant::now() < deadline => continue,
             Err(e) => {
                 let (code, err) = match e {
@@ -292,12 +298,14 @@ mod tests {
             nodes: vec![],
             max_connections: None,
             note: None,
+            balance: None,
             created_at: 0,
         };
         store.insert_user("alice".into(), cfg);
         SocksCtx {
             store,
             limiter: Arc::new(SocksAuthLimiter::new(Duration::from_secs(60))),
+            balance: Strategy::default(),
             handshake_timeout: Duration::from_secs(5),
             connect_timeout: Duration::from_secs(5),
         }

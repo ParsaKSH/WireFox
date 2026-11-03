@@ -2,6 +2,7 @@
 //! control API.
 
 pub mod api;
+pub mod balance;
 pub mod config;
 pub mod limiter;
 pub mod socks;
@@ -53,6 +54,7 @@ pub async fn start(cfg: ServerConfig) -> Result<Server> {
     let socks_ctx = socks::SocksCtx {
         store: store.clone(),
         limiter: Arc::new(SocksAuthLimiter::new(Duration::from_secs(300))),
+        balance: cfg.socks.balance,
         handshake_timeout: Duration::from_secs(cfg.socks.handshake_timeout_secs),
         connect_timeout: Duration::from_secs(cfg.socks.connect_timeout_secs),
     };
@@ -77,7 +79,8 @@ pub async fn start(cfg: ServerConfig) -> Result<Server> {
         }
         None => tunnel_addr.to_string(),
     };
-    let api_state = api::ApiState::new(store.clone(), cfg.api.clone(), fingerprint.clone(), public_tunnel_addr)?;
+    let api_state =
+        api::ApiState::new(store.clone(), cfg.api.clone(), fingerprint.clone(), public_tunnel_addr, cfg.socks.balance)?;
     let app = api::router(api_state)?;
     let (listener, api_addr) = bind(cfg.api.listen, "api")?;
     tokio::spawn(api::serve(listener, cfg.api.tls.then(|| public_tls.clone()), app));

@@ -2,12 +2,14 @@
 
 use std::net::SocketAddr;
 use std::path::PathBuf;
+use std::sync::atomic::Ordering;
 use std::time::Duration;
 
 use argon2::password_hash::PasswordHasher;
 use serde_json::{json, Value};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
+use tokio::task::JoinHandle;
 use wirefox_server::config::ServerConfig;
 use wirefox_server::Server;
 
@@ -70,18 +72,29 @@ async fn api(addr: SocketAddr, method: &str, path: &str, token: Option<&str>, bo
     (status, json)
 }
 
-async fn start_node(fixture: &Fixture, node_config: &str, pool_size: u32) {
+/// Start a node and wait until the server sees it. Aborting the returned task
+/// takes the node offline.
+async fn start_node(fixture: &Fixture, node_config: &str, pool_size: u32) -> JoinHandle<()> {
     let config = format!("{node_config}\npool_size = {pool_size}\nallow_local = true\n");
-    let node = wirefox_node::Node::new(wirefox_node::NodeConfig::parse(&config).unwrap()).unwrap();
-    tokio::spawn(node.run());
+    let config = wirefox_node::NodeConfig::parse(&config).unwrap();
+    let id = config.node_id.clone();
+    let task = tokio::spawn(wirefox_node::Node::new(config).unwrap().run());
     for _ in 0..100 {
-        let online = fixture.server.store.nodes.read().values().any(|n| n.online_session().is_some());
-        if online {
-            return;
+        if fixture.server.store.node(&id).is_some_and(|n| n.online_session().is_some()) {
+            return task;
         }
         tokio::time::sleep(Duration::from_millis(50)).await;
     }
-    panic!("node never came online");
+    panic!("node {id} never came online");
+}
+
+/// Connections each node has carried so far.
+fn totals(fixture: &Fixture, ids: &[&str]) -> Vec<u64> {
+    ids.iter().map(|id| fixture.server.store.node(id).unwrap().stats.total.load(Ordering::Relaxed)).collect()
+}
+
+fn delta(after: &[u64], before: &[u64]) -> Vec<u64> {
+    after.iter().zip(before).map(|(a, b)| a - b).collect()
 }
 
 async fn echo_server() -> SocketAddr {
@@ -259,4 +272,93 @@ async fn rotated_token_disconnects_node() {
     tokio::time::sleep(Duration::from_secs(3)).await;
     let (_, node) = api(api_addr, "GET", "/nodes/n1", Some(API_KEY), None).await;
     assert_eq!(node["online"], false);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn load_balancing_across_nodes() {
+    let fixture = start_server().await;
+    let api_addr = fixture.server.api_addr;
+    let socks = fixture.server.socks_addrs[0];
+    let target = echo_server().await;
+    let ids = ["n1", "n2", "n3"];
+    let mut nodes = Vec::new();
+    for id in ids {
+        let (_, created) = api(api_addr, "POST", "/nodes", Some(API_KEY), Some(json!({"id": id}))).await;
+        nodes.push(start_node(&fixture, created["node_config"].as_str().unwrap(), 2).await);
+    }
+    for strategy in ["round-robin", "least-ping", "least-load", "random"] {
+        let body = json!({"username": strategy, "password": "pw", "balance": strategy});
+        let (status, user) = api(api_addr, "POST", "/users", Some(API_KEY), Some(body)).await;
+        assert_eq!(status, 200, "{user}");
+        assert_eq!(user["user"]["balance"], strategy);
+    }
+
+    // round-robin: strictly in turn.
+    let before = totals(&fixture, &ids);
+    for _ in 0..12 {
+        assert_eq!(socks_connect(socks, "round-robin", "pw", target).await.1, 0);
+    }
+    assert_eq!(delta(&totals(&fixture, &ids), &before), [4, 4, 4]);
+
+    // least-load: connections held open spread out evenly.
+    let before = totals(&fixture, &ids);
+    let mut held = Vec::new();
+    for _ in 0..9 {
+        let (stream, code) = socks_connect(socks, "least-load", "pw", target).await;
+        assert_eq!(code, 0);
+        held.push(stream);
+    }
+    assert_eq!(delta(&totals(&fixture, &ids), &before), [3, 3, 3]);
+    drop(held);
+
+    // random: every node gets some of 60 connections (failing by chance is ~1e-10).
+    let before = totals(&fixture, &ids);
+    for _ in 0..60 {
+        assert_eq!(socks_connect(socks, "random", "pw", target).await.1, 0);
+    }
+    let spread = delta(&totals(&fixture, &ids), &before);
+    assert!(spread.iter().all(|&n| n > 0), "{spread:?}");
+
+    // least-ping: everything goes to the node with the lowest measured RTT.
+    let mut rtts = Vec::new();
+    for _ in 0..100 {
+        rtts = ids
+            .iter()
+            .map(|id| fixture.server.store.node(id).unwrap().online_session().unwrap().rtt_us.load(Ordering::Relaxed))
+            .collect();
+        if rtts.iter().all(|&r| r > 0) {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    let fastest = rtts.iter().enumerate().min_by_key(|(_, r)| **r).unwrap().0;
+    let before = totals(&fixture, &ids);
+    for _ in 0..5 {
+        assert_eq!(socks_connect(socks, "least-ping", "pw", target).await.1, 0);
+    }
+    let mut expected = [0; 3];
+    expected[fastest] = 5;
+    assert_eq!(delta(&totals(&fixture, &ids), &before), expected, "rtts {rtts:?}");
+
+    // A node going offline just drops out of the rotation.
+    nodes.remove(1).abort();
+    for _ in 0..100 {
+        if fixture.server.store.node("n2").unwrap().online_session().is_none() {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    let before = totals(&fixture, &ids);
+    for _ in 0..6 {
+        let (mut stream, code) = socks_connect(socks, "round-robin", "pw", target).await;
+        assert_eq!(code, 0);
+        assert_echo(&mut stream).await;
+    }
+    assert_eq!(delta(&totals(&fixture, &ids), &before), [3, 0, 3]);
+
+    // Clearing a user's strategy falls back to the server default (least-load).
+    let (_, user) = api(api_addr, "PATCH", "/users/random", Some(API_KEY), Some(json!({"balance": null}))).await;
+    assert!(user["balance"].is_null());
+    let (_, status) = api(api_addr, "GET", "/status", Some(API_KEY), None).await;
+    assert_eq!(status["default_balance"], "least-load");
 }

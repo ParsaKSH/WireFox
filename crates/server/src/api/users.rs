@@ -8,6 +8,7 @@ use serde_json::json;
 use tracing::info;
 
 use super::{default_true, double_option, error, ok, valid_id, ApiError, ApiResult, ApiState};
+use crate::balance::Strategy;
 use crate::state::{now_secs, SocksPassword, TrafficSnapshot, UserCfg, UserEntry};
 
 #[derive(Serialize)]
@@ -17,6 +18,8 @@ pub struct UserView {
     nodes: Vec<String>,
     max_connections: Option<u32>,
     note: Option<String>,
+    /// `None`: the server default.
+    balance: Option<Strategy>,
     created_at: u64,
     traffic: TrafficSnapshot,
 }
@@ -30,6 +33,7 @@ impl UserView {
             nodes: cfg.nodes,
             max_connections: cfg.max_connections,
             note: cfg.note,
+            balance: cfg.balance,
             created_at: cfg.created_at,
             traffic: user.stats.snapshot(),
         }
@@ -79,6 +83,7 @@ pub struct CreateUser {
     nodes: Vec<String>,
     max_connections: Option<u32>,
     note: Option<String>,
+    balance: Option<Strategy>,
 }
 
 pub async fn create(State(st): State<Arc<ApiState>>, Json(body): Json<CreateUser>) -> ApiResult<serde_json::Value> {
@@ -95,6 +100,7 @@ pub async fn create(State(st): State<Arc<ApiState>>, Json(body): Json<CreateUser
         nodes: body.nodes,
         max_connections: body.max_connections,
         note: body.note,
+        balance: body.balance,
         created_at: now_secs(),
     };
     if !st.store.insert_user(body.username.clone(), cfg) {
@@ -120,6 +126,9 @@ pub struct UpdateUser {
     max_connections: Option<Option<u32>>,
     #[serde(default, deserialize_with = "double_option")]
     note: Option<Option<String>>,
+    /// `null` goes back to the server default.
+    #[serde(default, deserialize_with = "double_option")]
+    balance: Option<Option<Strategy>>,
 }
 
 pub async fn update(
@@ -151,6 +160,9 @@ pub async fn update(
         }
         if let Some(note) = body.note {
             cfg.note = note;
+        }
+        if let Some(balance) = body.balance {
+            cfg.balance = balance;
         }
         (cfg.enabled, cfg.nodes.clone())
     };

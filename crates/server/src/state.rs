@@ -4,7 +4,7 @@
 use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -14,6 +14,7 @@ use serde::{Deserialize, Serialize};
 use tokio_util::sync::CancellationToken;
 use wirefox_common::proto::EgressSpec;
 
+use crate::balance::{self, Candidate, Strategy};
 use crate::tunnel::NodeSession;
 
 /// Traffic counters are flushed to disk at least this often.
@@ -160,6 +161,10 @@ pub struct UserCfg {
     pub max_connections: Option<u32>,
     #[serde(default)]
     pub note: Option<String>,
+    /// How this user's connections are spread over nodes. `None` means the
+    /// server default (`socks.balance`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub balance: Option<Strategy>,
     pub created_at: u64,
 }
 
@@ -167,6 +172,8 @@ pub struct UserEntry {
     pub username: String,
     pub cfg: RwLock<UserCfg>,
     pub stats: Arc<Traffic>,
+    /// Round-robin position.
+    pub turn: AtomicUsize,
 }
 
 pub struct ConnEntry {
@@ -286,6 +293,7 @@ impl Store {
                     username: u.username.clone(),
                     cfg: RwLock::new(u.cfg),
                     stats: Arc::new(Traffic::with_totals(u.bytes_up, u.bytes_down)),
+                    turn: AtomicUsize::new(0),
                 };
                 (u.username, Arc::new(entry))
             })
@@ -327,7 +335,12 @@ impl Store {
         if users.contains_key(&username) {
             return false;
         }
-        let entry = UserEntry { username: username.clone(), cfg: RwLock::new(cfg), stats: Default::default() };
+        let entry = UserEntry {
+            username: username.clone(),
+            cfg: RwLock::new(cfg),
+            stats: Default::default(),
+            turn: Default::default(),
+        };
         users.insert(username, Arc::new(entry));
         true
     }
@@ -346,22 +359,27 @@ impl Store {
         ok.then_some(user)
     }
 
-    /// The least loaded online node this user may use.
-    pub fn pick_node(&self, user: &UserEntry) -> Option<(Arc<NodeEntry>, Arc<NodeSession>)> {
-        let allowed = user.cfg.read();
-        let nodes = self.nodes.read();
-        let usable = |node: &Arc<NodeEntry>| {
-            if !node.cfg.read().enabled {
-                return None;
-            }
-            node.online_session().map(|session| (node.clone(), session))
+    /// Pick an online node for a new connection of this user, skipping `exclude`
+    /// (nodes that already failed this connection).
+    pub fn pick_node(&self, user: &UserEntry, default: Strategy, exclude: &[String]) -> Option<Candidate> {
+        let (strategy, mut candidates) = {
+            let cfg = user.cfg.read();
+            let nodes = self.nodes.read();
+            let usable = |node: &Arc<NodeEntry>| {
+                if !node.cfg.read().enabled || exclude.contains(&node.id) {
+                    return None;
+                }
+                node.online_session().map(|session| Candidate { node: node.clone(), session })
+            };
+            let candidates: Vec<_> = if cfg.nodes.is_empty() {
+                nodes.values().filter_map(usable).collect()
+            } else {
+                cfg.nodes.iter().filter_map(|id| nodes.get(id)).filter_map(usable).collect()
+            };
+            (cfg.balance.unwrap_or(default), candidates)
         };
-        let load = |(node, _): &(Arc<NodeEntry>, Arc<NodeSession>)| node.stats.active.load(Ordering::Relaxed);
-        if allowed.nodes.is_empty() {
-            nodes.values().filter_map(usable).min_by_key(load)
-        } else {
-            allowed.nodes.iter().filter_map(|id| nodes.get(id)).filter_map(usable).min_by_key(load)
-        }
+        candidates.sort_by(|a, b| a.node.id.cmp(&b.node.id));
+        balance::choose(strategy, candidates, &user.turn)
     }
 
     /// Whether the user may still use this node: both exist and are enabled, and
@@ -474,6 +492,7 @@ mod tests {
             nodes: vec![],
             max_connections: None,
             note: None,
+            balance: None,
             created_at: 0,
         }
     }

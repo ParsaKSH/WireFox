@@ -127,6 +127,8 @@ listen = ["0.0.0.0:1080"]
 tls_listen = ["0.0.0.0:1443"]
 handshake_timeout_secs = 10
 connect_timeout_secs = 15
+# How connections are spread over nodes: round-robin, least-ping, least-load, random
+balance = "least-load"
 
 [api]
 listen = "127.0.0.1:9090"

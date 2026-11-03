@@ -31,6 +31,7 @@ use tower::ServiceExt;
 use tracing::debug;
 use wirefox_common::net::accept;
 
+use crate::balance::Strategy;
 use crate::config::ApiSection;
 use crate::limiter::{client_key, FailureLimiter};
 use crate::state::Store;
@@ -50,6 +51,8 @@ pub struct ApiState {
     pub fingerprint: String,
     /// Tunnel address (`host:port`) to put in generated node configs.
     pub public_tunnel_addr: String,
+    /// Node selection for users without their own `balance`.
+    pub default_balance: Strategy,
     pub started: Instant,
     /// SHA-256 of session token -> expiry.
     sessions: Mutex<HashMap<[u8; 32], Instant>>,
@@ -64,6 +67,7 @@ impl ApiState {
         cfg: ApiSection,
         fingerprint: String,
         public_tunnel_addr: String,
+        default_balance: Strategy,
     ) -> anyhow::Result<Arc<Self>> {
         let api_keys = cfg
             .api_key_hashes
@@ -80,6 +84,7 @@ impl ApiState {
             cfg,
             fingerprint,
             public_tunnel_addr,
+            default_balance,
             started: Instant::now(),
             sessions: Mutex::new(HashMap::new()),
             api_keys,
@@ -180,6 +185,7 @@ async fn status(State(st): State<Arc<ApiState>>) -> ApiResult<serde_json::Value>
         "version": wirefox_common::VERSION,
         "uptime_secs": st.started.elapsed().as_secs(),
         "tunnel_fingerprint": st.fingerprint,
+        "default_balance": st.default_balance,
         "nodes_total": nodes_total,
         "nodes_online": nodes_online,
         "users_total": store.users.read().len(),
