@@ -1,0 +1,182 @@
+// Control channel between wirefox-panel and the exit-nodes it manages.
+//
+// The node dials the panel and keeps one Connect stream open for as long as it
+// runs, reconnecting with backoff whenever it drops. The panel can't reach the
+// nodes (they sit behind NAT, on routers, on Windows desktops), so every
+// command travels down this stream.
+//
+// Transport: gRPC over TLS 1.3. The panel's certificate is self-signed and the
+// node pins its SHA-256 fingerprint, which comes from the node key (below).
+// TLS SNI is "wirefox-panel".
+//
+// Authentication: the node sends its secret in the request metadata as
+// `authorization: Bearer <secret>`. The panel stores only SHA-256(secret).
+//
+// Node key: the single string an operator pastes into the node. It is
+//
+//     "wfx1." + base64url_nopad(JSON)
+//
+// where the JSON object is
+//
+//     {"panel": "<host:port of the panel's gRPC listener>",
+//      "fp":    "<hex SHA-256 of the panel's certificate>",
+//      "secret":"<hex, 32 random bytes>"}
+//
+// Conversation:
+//   1. node -> Hello
+//   2. panel -> Welcome, then the node's current TunnelConfig
+//   3. node -> Status every Welcome.status_interval_secs, and right away when
+//      its tunnel state changes
+//   4. panel -> TunnelConfig whenever the operator changes it, and Command
+//      whenever one is issued; the node answers each Command with a
+//      CommandResult carrying the same id.
+//
+// The node persists the last TunnelConfig it applied, so it keeps its tunnel
+// to the WireFox server running while the panel is unreachable.
+syntax = "proto3";
+
+package wirefox.agent.v1;
+
+option go_package = "github.com/ParsaKSH/WireFox/panel/internal/agentpb;agentpb";
+
+service Agent {
+  rpc Connect(stream NodeMessage) returns (stream PanelMessage);
+}
+
+message NodeMessage {
+  oneof msg {
+    Hello hello = 1;
+    Status status = 2;
+    CommandResult result = 3;
+  }
+}
+
+message PanelMessage {
+  oneof msg {
+    Welcome welcome = 1;
+    TunnelConfig config = 2;
+    Command command = 3;
+  }
+}
+
+message Hello {
+  string version = 1;
+  string os = 2;
+  string arch = 3;
+  string hostname = 4;
+  repeated Interface interfaces = 5;
+  // Version of the TunnelConfig the node is running, 0 if none.
+  uint64 config_version = 6;
+}
+
+message Interface {
+  string name = 1;
+  // Windows adapter GUID; empty elsewhere.
+  string adapter_name = 2;
+  // 0 when unknown.
+  uint32 index = 3;
+  bool up = 4;
+  repeated string addrs = 5;
+}
+
+message Welcome {
+  // The id of this node in the panel and in the WireFox server.
+  string node_id = 1;
+  // How often the node should send Status. The panel drops the stream when it
+  // hears nothing for three intervals.
+  uint32 status_interval_secs = 2;
+}
+
+// Everything the node needs to run its tunnel to the WireFox server. Applying
+// the same version twice is a no-op.
+message TunnelConfig {
+  uint64 version = 1;
+  // false: stop the tunnel (the agent stream stays up).
+  bool enabled = 2;
+  // host:port of the WireFox server's tunnel listener.
+  string server = 3;
+  string server_name = 4;
+  // Hex SHA-256 of the WireFox server's certificate.
+  string server_fingerprint = 5;
+  string node_id = 6;
+  string token = 7;
+  uint32 pool_size = 8;
+  uint32 max_extra = 9;
+  uint32 connect_timeout_secs = 10;
+  bool allow_local = 11;
+  Egress egress = 12;
+  Egress uplink = 13;
+}
+
+// Empty strings mean "not set".
+message Egress {
+  string interface = 1;
+  string source_ip = 2;
+}
+
+enum TunnelState {
+  TUNNEL_STATE_UNSPECIFIED = 0;
+  // No config yet, or the config disables the tunnel.
+  TUNNEL_STATE_STOPPED = 1;
+  TUNNEL_STATE_CONNECTING = 2;
+  TUNNEL_STATE_CONNECTED = 3;
+  // The last attempt failed; the node keeps retrying. See last_error.
+  TUNNEL_STATE_ERROR = 4;
+}
+
+message Status {
+  uint64 config_version = 1;
+  TunnelState tunnel_state = 2;
+  string last_error = 3;
+  // Seconds since the node process started.
+  uint64 uptime_secs = 4;
+  // Seconds since the tunnel last connected; 0 when not connected.
+  uint64 connected_secs = 5;
+  // Streams the node is relaying right now, and since start.
+  uint64 active_streams = 6;
+  uint64 total_streams = 7;
+}
+
+message Command {
+  // Echoed back in CommandResult.
+  string id = 1;
+  oneof kind {
+    RestartTunnel restart_tunnel = 2;
+    ListInterfaces list_interfaces = 3;
+    FetchLogs fetch_logs = 4;
+  }
+}
+
+message RestartTunnel {}
+
+message ListInterfaces {}
+
+message FetchLogs {
+  // Most recent lines to return; the node keeps at least 1000.
+  uint32 lines = 1;
+}
+
+message CommandResult {
+  string id = 1;
+  // Set when the command failed.
+  string error = 2;
+  oneof payload {
+    InterfaceList interfaces = 3;
+    LogBatch logs = 4;
+  }
+}
+
+message InterfaceList {
+  repeated Interface interfaces = 1;
+}
+
+message LogBatch {
+  repeated LogLine lines = 1;
+}
+
+message LogLine {
+  int64 unix_ms = 1;
+  // "ERROR", "WARN", "INFO", "DEBUG" or "TRACE".
+  string level = 2;
+  string message = 3;
+}

@@ -12,9 +12,12 @@ pub const VERSION: &str = env!("CARGO_PKG_VERSION");
 
 /// Set up logging. `RUST_LOG` overrides `default_level`.
 pub fn init_tracing(default_level: &str) {
+    use std::io::IsTerminal;
     use tracing_subscriber::EnvFilter;
     let filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new(default_level));
-    tracing_subscriber::fmt().with_env_filter(filter).with_target(false).init();
+    // Colours only on a terminal; under systemd they'd end up as junk in the journal.
+    let ansi = std::io::stdout().is_terminal();
+    tracing_subscriber::fmt().with_env_filter(filter).with_target(false).with_ansi(ansi).init();
 }
 
 /// Random hex token made of `bytes` bytes from the OS CSPRNG.
