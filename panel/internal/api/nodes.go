@@ -36,6 +36,13 @@ type coreNodeView struct {
 	Remote      string       `json:"remote"`
 	ConnectedAt int64        `json:"connected_at"`
 	Traffic     core.Traffic `json:"traffic"`
+	// Set through the core API, it beats config.egress; the panel clears it
+	// when it adopts the node or its egress is saved.
+	EgressOverride *core.Egress `json:"egress_override"`
+	// What the node reports using while online, and why it can't use
+	// what it was given.
+	ActiveEgress *core.Egress `json:"active_egress"`
+	EgressError  string       `json:"egress_error"`
 }
 
 type agentView struct {
@@ -58,7 +65,6 @@ type tunnelSection struct {
 func (a *API) view(id string, cn *core.Node, local *store.Node) nodeView {
 	if local == nil {
 		local = store.NewNode(id)
-		local.ConfigVersion = 0
 	}
 	v := nodeView{
 		ID:        id,
@@ -79,12 +85,15 @@ func (a *API) view(id string, cn *core.Node, local *store.Node) nodeView {
 	if cn != nil {
 		v.Name, v.Enabled, v.CreatedAt = cn.Name, cn.Enabled, cn.CreatedAt
 		v.Core.Traffic = cn.Traffic
+		v.Core.EgressOverride = cn.EgressOverride
 		if cn.Online && cn.Session != nil {
 			v.Core.Online = true
 			v.Core.RTTMs = cn.Session.RTTMs
 			v.Core.IdlePool = cn.Session.IdlePool
 			v.Core.Remote = cn.Session.Remote
 			v.Core.ConnectedAt = cn.Session.ConnectedAt
+			v.Core.ActiveEgress = &cn.Session.ActiveEgress
+			v.Core.EgressError = cn.Session.EgressError
 		}
 	}
 	if live := a.Agents.Live(id); live != nil {
@@ -189,9 +198,23 @@ func (a *API) getNode(w http.ResponseWriter, r *http.Request, _ string) {
 	writeJSON(w, http.StatusOK, a.view(id, cn, local))
 }
 
+const errNodeGone = "the node no longer exists in the WireFox server"
+
+// noAgentAddrError means nodes couldn't reach the panel at the address a key
+// would carry.
+type noAgentAddrError struct {
+	host string
+}
+
+func (e *noAgentAddrError) Error() string {
+	return fmt.Sprintf("nodes can't reach the panel at %q: set the agent address in Settings first", e.host)
+}
+
 // nodeKey builds the key for a fresh agent secret. Until agent_public_addr is
 // set, nodes are sent to the host the admin reached the panel at; that
 // address is then saved as the setting, so keys and tunnel configs agree.
+// A host only this machine can reach (an SSH tunnel to 127.0.0.1, say) is
+// refused with a *noAgentAddrError instead.
 func (a *API) nodeKey(r *http.Request, secret string) (string, error) {
 	ctx := r.Context()
 	addr, err := a.Store.Setting(ctx, store.SettingAgentPublicAddr)
@@ -199,9 +222,12 @@ func (a *API) nodeKey(r *http.Request, secret string) (string, error) {
 		return "", err
 	}
 	if addr == "" {
-		host, _, err := net.SplitHostPort(r.Host)
-		if err != nil {
-			host = r.Host
+		host := a.TrustedProxies.host(r)
+		if h, _, err := net.SplitHostPort(host); err == nil {
+			host = h
+		}
+		if !agent.Dialable(host) {
+			return "", &noAgentAddrError{host: host}
 		}
 		addr = net.JoinHostPort(host, a.GRPCPort)
 		if err := a.Store.SetSetting(ctx, store.SettingAgentPublicAddr, addr); err != nil {
@@ -214,6 +240,16 @@ func (a *API) nodeKey(r *http.Request, secret string) (string, error) {
 	return keys.NodeKey{Panel: addr, Fingerprint: a.Cert.Fingerprint, Secret: secret}.Encode(), nil
 }
 
+// keyError answers for a failed nodeKey.
+func (a *API) keyError(w http.ResponseWriter, r *http.Request, err error) {
+	var addrErr *noAgentAddrError
+	if errors.As(err, &addrErr) {
+		writeError(w, http.StatusConflict, addrErr.Error())
+		return
+	}
+	a.internalError(w, r, err)
+}
+
 func (a *API) createNode(w http.ResponseWriter, r *http.Request, _ string) {
 	var req struct {
 		ID   string `json:"id"`
@@ -222,13 +258,17 @@ func (a *API) createNode(w http.ResponseWriter, r *http.Request, _ string) {
 	if !decode(w, r, &req) {
 		return
 	}
+	if onlyDots(req.ID) {
+		writeError(w, http.StatusBadRequest, "id must not be made of dots only")
+		return
+	}
 	ctx := r.Context()
 	// Built first: it may settle agent_public_addr, which the new node's
 	// first config then already uses.
 	secret := keys.NewSecret()
 	key, err := a.nodeKey(r, secret)
 	if err != nil {
-		a.internalError(w, r, err)
+		a.keyError(w, r, err)
 		return
 	}
 	cn, token, err := a.Core.CreateNode(ctx, req.ID, req.Name)
@@ -241,8 +281,12 @@ func (a *API) createNode(w http.ResponseWriter, r *http.Request, _ string) {
 	node.Token = token
 	node.AgentKeyHash = keys.Hash(secret)
 	node.KeyCreatedAt = time.Now().Unix()
-	// A leftover record from a node deleted in the core behind our back.
-	if err := a.Store.DeleteNode(ctx, cn.ID); err != nil && !errors.Is(err, store.ErrNotFound) {
+	// A leftover record from a node deleted in the core behind our back; its
+	// agent must not stay connected to the new node.
+	switch err := a.Store.DeleteNode(ctx, cn.ID); {
+	case err == nil:
+		a.Agents.Disconnect(cn.ID)
+	case !errors.Is(err, store.ErrNotFound):
 		a.internalError(w, r, err)
 		return
 	}
@@ -342,28 +386,31 @@ func (a *API) updateNode(w http.ResponseWriter, r *http.Request, _ string) {
 		return
 	}
 	ctx := r.Context()
+	var err error
 	if patch.Name != nil || patch.Enabled != nil {
 		if cn == nil {
-			writeError(w, http.StatusConflict, "the node no longer exists in the WireFox server")
+			writeError(w, http.StatusConflict, errNodeGone)
 			return
 		}
-		var err error
 		if cn, err = a.Core.UpdateNode(ctx, id, core.NodePatch{Name: patch.Name, Enabled: patch.Enabled}); err != nil {
 			a.coreError(w, err)
 			return
 		}
 	}
+	if local == nil || patch.Egress != nil {
+		if cn, err = a.dropEgressOverride(ctx, cn); err != nil {
+			a.coreError(w, err)
+			return
+		}
+	}
 	if local == nil {
-		// A node created in the core directly: the panel adopts it.
-		local = store.NewNode(id)
-		local.Name, local.Enabled, local.CreatedAt = cn.Name, cn.Enabled, cn.CreatedAt
-		if err := a.Store.CreateNode(ctx, local); err != nil && !errors.Is(err, store.ErrExists) {
+		if err := a.adopt(ctx, cn); err != nil {
 			a.internalError(w, r, err)
 			return
 		}
 	}
 	var changed bool
-	local, err := a.Store.UpdateNode(ctx, id, func(n *store.Node) error {
+	local, err = a.Store.UpdateNode(ctx, id, func(n *store.Node) error {
 		changed = patch.apply(n)
 		return nil
 	})
@@ -399,56 +446,78 @@ func (a *API) deleteNode(w http.ResponseWriter, r *http.Request, _ string) {
 	writeOK(w)
 }
 
+// newNodeKey replaces every credential of the node: its agent key and its
+// tunnel token, which holders of the old key have seen in its TunnelConfig.
+// The node's tunnel stops until it runs with the new key.
 func (a *API) newNodeKey(w http.ResponseWriter, r *http.Request, _ string) {
 	id := r.PathValue("id")
 	cn, local, ok := a.lookup(w, r, id)
 	if !ok {
 		return
 	}
+	if cn == nil {
+		writeError(w, http.StatusConflict, errNodeGone)
+		return
+	}
 	ctx := r.Context()
+	secret := keys.NewSecret()
+	key, err := a.nodeKey(r, secret)
+	if err != nil {
+		a.keyError(w, r, err)
+		return
+	}
 	if local == nil {
-		local = store.NewNode(id)
-		local.Name, local.Enabled, local.CreatedAt = cn.Name, cn.Enabled, cn.CreatedAt
-		if err := a.Store.CreateNode(ctx, local); err != nil && !errors.Is(err, store.ErrExists) {
+		if cn, err = a.dropEgressOverride(ctx, cn); err != nil {
+			a.coreError(w, err)
+			return
+		}
+		if err := a.adopt(ctx, cn); err != nil {
 			a.internalError(w, r, err)
 			return
 		}
 	}
-	// The panel only learns a node's tunnel token when it creates one.
-	var token string
-	if local.Token == "" {
-		if cn == nil {
-			writeError(w, http.StatusConflict, "the node no longer exists in the WireFox server")
-			return
-		}
-		var err error
-		if token, err = a.Core.RotateToken(ctx, id); err != nil {
-			a.coreError(w, err)
-			return
-		}
+	token, err := a.Core.RotateToken(ctx, id)
+	if err != nil {
+		a.coreError(w, err)
+		return
 	}
-	secret := keys.NewSecret()
-	_, err := a.Store.UpdateNode(ctx, id, func(n *store.Node) error {
+	_, err = a.Store.UpdateNode(ctx, id, func(n *store.Node) error {
 		n.AgentKeyHash = keys.Hash(secret)
 		n.KeyCreatedAt = time.Now().Unix()
-		if token != "" {
-			n.Token = token
-			n.ConfigVersion++
-		}
+		n.Token = token
+		n.ConfigVersion++
 		return nil
 	})
 	if err != nil {
 		a.internalError(w, r, err)
 		return
 	}
+	// Not pushed: the stream still open uses the old key. The node gets the
+	// new config when it connects with the new one.
 	a.Agents.Disconnect(id)
-	key, err := a.nodeKey(r, secret)
-	if err != nil {
-		a.internalError(w, r, err)
-		return
-	}
 	a.event(ctx, store.Info, fmt.Sprintf("new key issued for node %s", id))
 	writeJSON(w, http.StatusOK, map[string]string{"key": key})
+}
+
+// adopt gives a node created in the core directly a record in the panel.
+func (a *API) adopt(ctx context.Context, cn *core.Node) error {
+	local := store.NewNode(cn.ID)
+	local.Name, local.Enabled, local.CreatedAt = cn.Name, cn.Enabled, cn.CreatedAt
+	err := a.Store.CreateNode(ctx, local)
+	if errors.Is(err, store.ErrExists) {
+		// Adopted by a request running at the same time.
+		return nil
+	}
+	return err
+}
+
+// dropEgressOverride clears an egress set for the node through the core API,
+// which would beat the egress the panel gives the node. cn may be nil.
+func (a *API) dropEgressOverride(ctx context.Context, cn *core.Node) (*core.Node, error) {
+	if cn == nil || cn.EgressOverride == nil {
+		return cn, nil
+	}
+	return a.Core.ClearEgressOverride(ctx, cn.ID)
 }
 
 // command sends cmd to the node's agent and maps the failures to statuses.
@@ -493,7 +562,7 @@ type logLine struct {
 }
 
 func (a *API) nodeLogs(w http.ResponseWriter, r *http.Request, _ string) {
-	lines := queryInt(r, "lines", 200, 5000)
+	lines := queryInt(r, "lines", defaultLogLines, maxLogLines)
 	cmd := &agentpb.Command{Kind: &agentpb.Command_FetchLogs{FetchLogs: &agentpb.FetchLogs{Lines: uint32(lines)}}}
 	res, ok := a.command(w, r, cmd)
 	if !ok {

@@ -22,7 +22,7 @@ type NodeKey struct {
 	Panel string `json:"panel"`
 	// Hex SHA-256 of the panel's certificate.
 	Fingerprint string `json:"fp"`
-	// Hex, 32 random bytes. The panel keeps only HashSecret(Secret).
+	// Hex, 32 random bytes. The panel keeps only Hash(Secret).
 	Secret string `json:"secret"`
 }
 

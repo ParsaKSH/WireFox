@@ -16,6 +16,8 @@ import (
 	"math/big"
 	"os"
 	"time"
+
+	"github.com/ParsaKSH/WireFox/panel/internal/atomicfile"
 )
 
 // CertName is the DNS name in the panel certificate and the SNI nodes send.
@@ -31,12 +33,14 @@ type Cert struct {
 }
 
 // LoadOrCreateCert loads the certificate and key at the given paths, or
-// generates a self-signed pair there when neither exists yet.
+// generates a self-signed pair there when there is no certificate yet. The
+// certificate is written last, so a key without one is left from a first
+// start that didn't finish, and nothing can have pinned it.
 func LoadOrCreateCert(certPath, keyPath string) (*Cert, error) {
 	_, certErr := os.Stat(certPath)
 	_, keyErr := os.Stat(keyPath)
 	switch {
-	case errors.Is(certErr, fs.ErrNotExist) && errors.Is(keyErr, fs.ErrNotExist):
+	case errors.Is(certErr, fs.ErrNotExist) && (keyErr == nil || errors.Is(keyErr, fs.ErrNotExist)):
 		if err := generate(certPath, keyPath); err != nil {
 			return nil, err
 		}
@@ -89,10 +93,10 @@ func generate(certPath, keyPath string) error {
 	if err != nil {
 		return err
 	}
-	if err := os.WriteFile(keyPath, pem.EncodeToMemory(&pem.Block{Type: "PRIVATE KEY", Bytes: keyDER}), 0o600); err != nil {
+	if err := atomicfile.Write(keyPath, pem.EncodeToMemory(&pem.Block{Type: "PRIVATE KEY", Bytes: keyDER}), 0o600); err != nil {
 		return fmt.Errorf("writing %s: %w", keyPath, err)
 	}
-	if err := os.WriteFile(certPath, pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: der}), 0o644); err != nil {
+	if err := atomicfile.Write(certPath, pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: der}), 0o644); err != nil {
 		return fmt.Errorf("writing %s: %w", certPath, err)
 	}
 	return nil

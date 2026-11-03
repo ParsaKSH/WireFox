@@ -138,15 +138,15 @@ func TestParseShowNeverStarted(t *testing.T) {
 	if st.ActiveState != "inactive" || st.MainPID != 0 || st.Since != 0 {
 		t.Fatalf("got %+v", st)
 	}
-	if got := parseTimestamp("@1793600000"); got != 1793600000 {
-		t.Fatalf("unix timestamp: %d", got)
-	}
 }
 
 func TestSystemdLogs(t *testing.T) {
 	journal := `{"__REALTIME_TIMESTAMP":"1793600000123456","PRIORITY":"6","MESSAGE":"\u001b[32m INFO\u001b[0m tunnel listening"}
 {"__REALTIME_TIMESTAMP":"1793600001000000","PRIORITY":"3","MESSAGE":[27,91,51,49,109,98,97,100,32,255,27,91,48,109]}
 {"__REALTIME_TIMESTAMP":"1793600002000000","MESSAGE":"no priority"}
+{"__REALTIME_TIMESTAMP":"1793600003000000","PRIORITY":"6","MESSAGE":"2026-11-03T05:55:12.123456Z  WARN tunnel.public_addr is not set"}
+{"__REALTIME_TIMESTAMP":"1793600004000000","PRIORITY":"6","MESSAGE":"ERROR node session failed"}
+{"__REALTIME_TIMESTAMP":"1793600005000000","PRIORITY":"6","MESSAGE":"user WARN is not a level"}
 not json
 {"PRIORITY":"6","MESSAGE":"no timestamp"}
 `
@@ -161,6 +161,9 @@ not json
 		{UnixMs: 1793600000123, Priority: 6, Message: " INFO tunnel listening"},
 		{UnixMs: 1793600001000, Priority: 3, Message: "bad \uFFFD"},
 		{UnixMs: 1793600002000, Priority: 6, Message: "no priority"},
+		{UnixMs: 1793600003000, Priority: 4, Message: "2026-11-03T05:55:12.123456Z  WARN tunnel.public_addr is not set"},
+		{UnixMs: 1793600004000, Priority: 3, Message: "ERROR node session failed"},
+		{UnixMs: 1793600005000, Priority: 6, Message: "user WARN is not a level"},
 	}
 	if !slices.Equal(entries, want) {
 		t.Fatalf("got %q\nwant %q", entries, want)

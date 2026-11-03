@@ -26,6 +26,7 @@ import (
 	"google.golang.org/grpc/status"
 
 	"github.com/ParsaKSH/WireFox/panel/internal/agentpb"
+	"github.com/ParsaKSH/WireFox/panel/internal/core"
 	"github.com/ParsaKSH/WireFox/panel/internal/keys"
 	"github.com/ParsaKSH/WireFox/panel/internal/store"
 )
@@ -33,15 +34,28 @@ import (
 const (
 	DefaultStatusInterval = 10 * time.Second
 	DefaultCommandTimeout = 10 * time.Second
-	// The name nodes expect in the WireFox server's certificate (a default SAN).
-	tunnelServerName = "wirefox"
-	// At most one "invalid key" event per this period; the rest are counted.
+	// At most one "invalid key" report per this period; the rest are counted.
 	authEventPeriod = time.Minute
+	// A node is dropped after this many status intervals without a message.
+	silentIntervals = 3
+
+	keepaliveTime    = 30 * time.Second
+	keepaliveTimeout = 10 * time.Second
+	// The shortest ping interval nodes may use.
+	minPingInterval = 10 * time.Second
+	// A node uses one stream; a few more cover a reconnect on the same
+	// connection.
+	maxStreamsPerConn = 8
+	// Connections without a stream are closed after this long; nodes open
+	// a new one when they reconnect.
+	maxConnIdle = 2 * time.Minute
 )
 
 var (
 	ErrNotConnected = errors.New("the node's agent is not connected")
 	ErrTimeout      = errors.New("the node did not answer in time")
+
+	errRevoked = status.Error(codes.Unauthenticated, "the node's key was revoked")
 )
 
 // CommandError is a command the node received but reports as failed.
@@ -121,13 +135,21 @@ func (s *Server) GRPCServer(cert *keys.Cert) *grpc.Server {
 	})
 	srv := grpc.NewServer(
 		grpc.Creds(creds),
-		grpc.KeepaliveParams(keepalive.ServerParameters{Time: 30 * time.Second, Timeout: 10 * time.Second}),
+		grpc.MaxConcurrentStreams(maxStreamsPerConn),
+		grpc.KeepaliveParams(keepalive.ServerParameters{
+			Time:              keepaliveTime,
+			Timeout:           keepaliveTimeout,
+			MaxConnectionIdle: maxConnIdle,
+		}),
 		// Nodes ping on their own to notice dead links early, also between
 		// streams while they reconnect.
 		grpc.KeepaliveEnforcementPolicy(keepalive.EnforcementPolicy{
-			MinTime:             10 * time.Second,
+			MinTime:             minPingInterval,
 			PermitWithoutStream: true,
 		}),
+		// Stop then waits for the stream handlers, which still record the
+		// nodes' last state.
+		grpc.WaitForHandlers(true),
 	)
 	agentpb.RegisterAgentServer(srv, s)
 	return srv
@@ -136,7 +158,9 @@ func (s *Server) GRPCServer(cert *keys.Cert) *grpc.Server {
 // conn is one live agent stream.
 type conn struct {
 	nodeID string
-	remote string
+	// The key hash the stream authenticated with.
+	keyHash string
+	remote  string
 	// Signals the stream to send the node's current config.
 	configDirty chan struct{}
 	commands    chan *agentpb.Command
@@ -151,9 +175,10 @@ type conn struct {
 	pending  map[string]chan *agentpb.CommandResult
 }
 
-func newConn(nodeID, remote string) *conn {
+func newConn(node *store.Node, remote string) *conn {
 	return &conn{
-		nodeID:      nodeID,
+		nodeID:      node.ID,
+		keyHash:     node.AgentKeyHash,
 		remote:      remote,
 		configDirty: make(chan struct{}, 1),
 		commands:    make(chan *agentpb.Command, 16),
@@ -194,8 +219,10 @@ func (s *Server) authenticate(ctx context.Context) (*store.Node, error) {
 	return node, nil
 }
 
+// authFailed reports a rejected key in the log and the event log, at most
+// once per authEventPeriod, so a client trying keys in a loop can't flood
+// either.
 func (s *Server) authFailed(ctx context.Context, remote string) {
-	s.log.Warn("agent connection with an invalid key", "remote", remote)
 	s.authMu.Lock()
 	now := time.Now()
 	if now.Sub(s.lastAuthEvent) < authEventPeriod {
@@ -203,12 +230,14 @@ func (s *Server) authFailed(ctx context.Context, remote string) {
 		s.authMu.Unlock()
 		return
 	}
-	msg := "rejected an agent connection with an invalid key from " + remote
-	if s.suppressedAuth > 0 {
-		msg += fmt.Sprintf(" (and %d more since the last report)", s.suppressedAuth)
-	}
+	suppressed := s.suppressedAuth
 	s.lastAuthEvent, s.suppressedAuth = now, 0
 	s.authMu.Unlock()
+	s.log.Warn("agent connection with an invalid key", "remote", remote, "suppressed", suppressed)
+	msg := "rejected an agent connection with an invalid key from " + remote
+	if suppressed > 0 {
+		msg += fmt.Sprintf(" (and %d more since the last report)", suppressed)
+	}
 	s.event(ctx, store.Warn, msg)
 }
 
@@ -251,7 +280,7 @@ func (s *Server) Connect(stream agentpb.Agent_ConnectServer) error {
 		}
 	}()
 
-	silence := 3 * s.statusInterval
+	silence := silentIntervals * s.statusInterval
 	timer := time.NewTimer(silence)
 	defer timer.Stop()
 
@@ -268,7 +297,7 @@ func (s *Server) Connect(stream agentpb.Agent_ConnectServer) error {
 	}
 	timer.Reset(silence)
 
-	c := newConn(node.ID, remoteAddr(ctx))
+	c := newConn(node, remoteAddr(ctx))
 	c.info = store.AgentInfo{TunnelState: "stopped"}
 	if node.Agent != nil {
 		c.info = *node.Agent
@@ -281,9 +310,15 @@ func (s *Server) Connect(stream agentpb.Agent_ConnectServer) error {
 	c.info.Interfaces = Interfaces(hello.GetInterfaces())
 	c.info.ConfigVersion = hello.GetConfigVersion()
 	c.lastSeen = time.Now()
-	s.saveInfo(ctx, c)
 
 	s.register(c)
+	// The key may have been replaced while we waited for Hello; Disconnect
+	// only finds streams that are registered.
+	if !s.keyValid(ctx, c) {
+		s.unregister(c)
+		return errRevoked
+	}
+	s.saveInfo(ctx, c)
 	s.log.Info("agent connected", "node", node.ID, "remote", c.remote, "version", c.info.Version)
 	s.event(ctx, store.Info, fmt.Sprintf("node %s connected to the panel from %s", node.ID, c.remote))
 	defer func() {
@@ -308,7 +343,7 @@ func (s *Server) Connect(stream agentpb.Agent_ConnectServer) error {
 	for {
 		select {
 		case <-c.configDirty:
-			if err := s.sendConfig(ctx, stream, node.ID); err != nil {
+			if err := s.sendConfig(ctx, stream, c); err != nil {
 				c.close(err)
 				return err
 			}
@@ -337,19 +372,36 @@ func (s *Server) Connect(stream agentpb.Agent_ConnectServer) error {
 	}
 }
 
-func (s *Server) sendConfig(ctx context.Context, stream agentpb.Agent_ConnectServer, nodeID string) error {
-	node, err := s.store.Node(ctx, nodeID)
+func (s *Server) sendConfig(ctx context.Context, stream agentpb.Agent_ConnectServer, c *conn) error {
+	node, err := s.store.Node(ctx, c.nodeID)
 	if err != nil {
 		return status.Error(codes.Unavailable, "node is gone")
+	}
+	// The config holds the node's tunnel token; a stream whose key was
+	// replaced must not see the new one.
+	if node.AgentKeyHash != c.keyHash {
+		return errRevoked
 	}
 	cfg, err := s.TunnelConfig(ctx, node)
 	if err != nil {
 		// The node keeps its last config; it gets the new one with the next
 		// change or connection.
-		s.log.Warn("not sending tunnel config", "node", nodeID, "err", err)
+		s.log.Warn("not sending tunnel config", "node", c.nodeID, "err", err)
 		return nil
 	}
 	return stream.Send(&agentpb.PanelMessage{Msg: &agentpb.PanelMessage_Config{Config: cfg}})
+}
+
+// keyValid reports whether c's key is still the node's key.
+func (s *Server) keyValid(ctx context.Context, c *conn) bool {
+	node, err := s.store.Node(ctx, c.nodeID)
+	if err != nil {
+		if !errors.Is(err, store.ErrNotFound) {
+			s.log.Error("looking up agent key", "node", c.nodeID, "err", err)
+		}
+		return false
+	}
+	return node.AgentKeyHash == c.keyHash
 }
 
 // TunnelConfig is everything node needs to run its tunnel. It fails while
@@ -359,8 +411,7 @@ func (s *Server) TunnelConfig(ctx context.Context, node *store.Node) (*agentpb.T
 	if err != nil {
 		return nil, err
 	}
-	host, _, err := net.SplitHostPort(ep.Server)
-	if ip, ipErr := netip.ParseAddr(host); err != nil || (ipErr == nil && ip.IsUnspecified()) {
+	if host, _, err := net.SplitHostPort(ep.Server); err != nil || !Dialable(host) {
 		return nil, fmt.Errorf("no public address for the WireFox server's tunnel listener (%s): "+
 			"set the core's tunnel public address or the panel's agent address", ep.Server)
 	}
@@ -374,7 +425,7 @@ func (s *Server) TunnelConfig(ctx context.Context, node *store.Node) (*agentpb.T
 		Version:            node.ConfigVersion,
 		Enabled:            node.Enabled,
 		Server:             ep.Server,
-		ServerName:         tunnelServerName,
+		ServerName:         core.DefaultTunnelSAN,
 		ServerFingerprint:  ep.Fingerprint,
 		NodeId:             node.ID,
 		Token:              node.Token,
@@ -385,6 +436,21 @@ func (s *Server) TunnelConfig(ctx context.Context, node *store.Node) (*agentpb.T
 		Egress:             &agentpb.Egress{Interface: node.Egress.Interface, SourceIp: node.Egress.SourceIP},
 		Uplink:             &agentpb.Egress{Interface: node.Uplink.Interface, SourceIp: node.Uplink.SourceIP},
 	}, nil
+}
+
+// Dialable reports whether nodes on other machines can reach host: it must
+// not be empty, localhost, or a loopback, link-local or unspecified IP.
+func Dialable(host string) bool {
+	host = strings.TrimSuffix(strings.ToLower(host), ".")
+	if host == "" || host == "localhost" || strings.HasSuffix(host, ".localhost") {
+		return false
+	}
+	ip, err := netip.ParseAddr(host)
+	if err != nil {
+		return true
+	}
+	ip = ip.Unmap()
+	return !ip.IsLoopback() && !ip.IsLinkLocalUnicast() && !ip.IsUnspecified()
 }
 
 func (s *Server) handle(ctx context.Context, c *conn, msg *agentpb.NodeMessage) {
@@ -401,6 +467,7 @@ func (s *Server) handle(ctx context.Context, c *conn, msg *agentpb.NodeMessage) 
 		c.info.TunnelState = tunnelState(st.GetTunnelState())
 		c.info.LastError = st.GetLastError()
 		c.info.UptimeSecs = st.GetUptimeSecs()
+		c.info.ConnectedSecs = st.GetConnectedSecs()
 		c.info.ActiveStreams = st.GetActiveStreams()
 		c.info.TotalStreams = st.GetTotalStreams()
 		c.mu.Unlock()
@@ -533,10 +600,11 @@ func (s *Server) PushConfig(nodeID string) {
 }
 
 // Disconnect ends the node's stream, if any. Used when its key changes or
-// the node is deleted.
+// the node is deleted, after the change is stored: a stream that registers
+// later checks its key again.
 func (s *Server) Disconnect(nodeID string) {
 	if c := s.conn(nodeID); c != nil {
-		c.close(status.Error(codes.Unauthenticated, "the node's key was revoked"))
+		c.close(errRevoked)
 	}
 }
 

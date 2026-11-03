@@ -11,6 +11,8 @@ import (
 	"strconv"
 	"strings"
 	"time"
+
+	"github.com/ParsaKSH/WireFox/panel/internal/atomicfile"
 )
 
 // ErrNotSupported is returned by managers that can't control the core process.
@@ -118,7 +120,7 @@ func (s *Systemd) Setup(ctx context.Context, restart bool) error {
 		return err
 	}
 	if !bytes.Equal(current, unit) {
-		if err := WriteFileAtomic(s.UnitPath(), unit, 0o644); err != nil {
+		if err := atomicfile.Write(s.UnitPath(), unit, 0o644); err != nil {
 			return fmt.Errorf("writing %s: %w", s.UnitPath(), err)
 		}
 		if _, err := s.systemctl(ctx, "daemon-reload"); err != nil {
@@ -163,12 +165,8 @@ func parseShow(unit string, out []byte) *UnitStatus {
 }
 
 // parseTimestamp reads systemctl's timestamps: "Tue 2026-11-03 05:55:12 UTC"
-// (ExecRunner forces UTC) or "@1793600000" with --timestamp=unix.
+// (ExecRunner forces UTC).
 func parseTimestamp(s string) int64 {
-	if unix, ok := strings.CutPrefix(s, "@"); ok {
-		n, _ := strconv.ParseInt(unix, 10, 64)
-		return n
-	}
 	t, err := time.Parse("Mon 2006-01-02 15:04:05 MST", s)
 	if err != nil {
 		return 0

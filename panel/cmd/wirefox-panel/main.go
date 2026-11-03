@@ -12,6 +12,7 @@ import (
 	"log/slog"
 	"net"
 	"net/http"
+	"net/netip"
 	"os"
 	"os/signal"
 	"path/filepath"
@@ -26,30 +27,37 @@ import (
 	"github.com/ParsaKSH/WireFox/panel/internal/web"
 )
 
-const passwordEnv = "WIREFOX_PANEL_PASSWORD"
+const (
+	passwordEnv = "WIREFOX_PANEL_PASSWORD"
+	// How long open web requests get to finish on shutdown.
+	shutdownTimeout = 5 * time.Second
+)
 
 // Set at build time: go build -ldflags "-X main.version=v1.2.3".
 var version = "dev"
 
 type options struct {
-	addr          string
-	grpcAddr      string
-	dataDir       string
-	coreMode      string
-	coreConfig    string
-	coreBinary    string
-	coreUnit      string
-	coreData      string
-	adminUser     string
-	resetPassword bool
-	tls           bool
-	tlsCert       string
-	tlsKey        string
+	addr           string
+	trustedProxies string
+	grpcAddr       string
+	dataDir        string
+	coreMode       string
+	coreConfig     string
+	coreBinary     string
+	coreUnit       string
+	coreData       string
+	adminUser      string
+	resetPassword  bool
+	tls            bool
+	tlsCert        string
+	tlsKey         string
 }
 
 func main() {
 	var o options
-	flag.StringVar(&o.addr, "addr", ":8080", "listen address of the web UI")
+	flag.StringVar(&o.addr, "addr", "127.0.0.1:8080", "listen address of the web UI")
+	flag.StringVar(&o.trustedProxies, "trusted-proxies", "",
+		"comma-separated CIDRs of reverse proxies whose X-Forwarded-For/-Host/-Proto headers are believed")
 	flag.StringVar(&o.grpcAddr, "grpc-addr", ":50051", "listen address for exit-node agents")
 	flag.StringVar(&o.dataDir, "data", "/var/lib/wirefox-panel", "panel data directory")
 	flag.StringVar(&o.coreMode, "core-mode", "systemd", "how the core runs: systemd (managed by the panel) or external")
@@ -84,6 +92,10 @@ func run(o options, log *slog.Logger) error {
 	}
 	if (o.tlsCert == "") != (o.tlsKey == "") {
 		return errors.New("-tls-cert and -tls-key go together")
+	}
+	proxies, err := api.ParseProxies(o.trustedProxies)
+	if err != nil {
+		return fmt.Errorf("-trusted-proxies: %w", err)
 	}
 	if err := os.MkdirAll(o.dataDir, 0o700); err != nil {
 		return err
@@ -136,15 +148,22 @@ func run(o options, log *slog.Logger) error {
 	if err != nil {
 		return err
 	}
+	tunnel, err := core.NewRunningTunnel(ctx, st, o.coreConfig)
+	if err != nil {
+		return err
+	}
 
 	agents := agent.NewServer(agent.Options{
 		Store:    st,
-		Endpoint: endpoint(st, o.coreConfig),
+		Endpoint: endpoint(st, tunnel),
 		Logger:   log.With("component", "agent"),
 	})
 	sampler := core.NewSampler(client.Status, core.SampleInterval, func(ctx context.Context, status *core.Status) {
 		if err := rememberFingerprint(ctx, st, status.TunnelFingerprint); err != nil {
 			log.Warn("saving the core fingerprint", "err", err)
+		}
+		if err := tunnel.Observe(ctx, status, time.Now()); err != nil {
+			log.Warn("reading the core's tunnel listener", "err", err)
 		}
 		if err := agents.SyncEndpoint(ctx); err != nil {
 			log.Warn("updating node configs", "err", err)
@@ -155,16 +174,13 @@ func run(o options, log *slog.Logger) error {
 	if err != nil {
 		return fmt.Errorf("-grpc-addr: %w", err)
 	}
-	var tlsConfig *tls.Config
-	switch {
-	case o.tlsCert != "":
-		uiCert, err := keys.LoadCert(o.tlsCert, o.tlsKey)
-		if err != nil {
-			return err
-		}
-		tlsConfig = &tls.Config{Certificates: []tls.Certificate{uiCert.TLS}, MinVersion: tls.VersionTLS12}
-	case o.tls:
-		tlsConfig = &tls.Config{Certificates: []tls.Certificate{cert.TLS}, MinVersion: tls.VersionTLS12}
+	tlsConfig, err := uiTLS(o, cert)
+	if err != nil {
+		return err
+	}
+	if tlsConfig == nil && !loopback(o.addr) {
+		log.Warn("the web UI is served over plain HTTP on a public address: passwords, sessions and node keys "+
+			"can be read on the way; use -tls, a TLS reverse proxy or an SSH tunnel", "addr", o.addr)
 	}
 
 	mux := http.NewServeMux()
@@ -174,11 +190,12 @@ func run(o options, log *slog.Logger) error {
 		Manager:        manager,
 		Agents:         agents,
 		Sampler:        sampler,
+		Tunnel:         tunnel,
 		Cert:           cert,
 		CoreConfigPath: o.coreConfig,
 		CoreBinary:     o.coreBinary,
 		GRPCPort:       grpcPort,
-		SecureCookies:  tlsConfig != nil,
+		TrustedProxies: proxies,
 		Logger:         log.With("component", "api"),
 	}))
 	mux.Handle("/", web.Handler())
@@ -206,7 +223,11 @@ func run(o options, log *slog.Logger) error {
 	if err := agents.SyncEndpoint(ctx); err != nil {
 		log.Warn("updating node configs", "err", err)
 	}
-	go sampler.Run(ctx)
+	samplerDone := make(chan struct{})
+	go func() {
+		sampler.Run(ctx)
+		close(samplerDone)
+	}()
 	errs := make(chan error, 2)
 	go func() {
 		log.Info("agent listener", "addr", grpcListener.Addr().String())
@@ -226,23 +247,53 @@ func run(o options, log *slog.Logger) error {
 		log.Info("shutting down")
 	case err = <-errs:
 	}
-	shutdownCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	stop()
+	shutdownCtx, cancel := context.WithTimeout(context.Background(), shutdownTimeout)
 	defer cancel()
 	if err := httpServer.Shutdown(shutdownCtx); err != nil {
 		log.Warn("stopping the web UI", "err", err)
 	}
 	// Agent streams never end on their own; nodes reconnect after a restart.
+	// Stop waits for their handlers, which record the nodes' last state,
+	// so the database is closed only after that.
 	grpcServer.Stop()
+	<-samplerDone
 	return err
 }
 
-// endpoint tells nodes where to find the core's tunnel listener.
-func endpoint(st *store.Store, coreConfig string) func(context.Context) (agent.Endpoint, error) {
-	return func(ctx context.Context) (agent.Endpoint, error) {
-		cfg, err := core.LoadConfig(coreConfig)
-		if err != nil {
-			return agent.Endpoint{}, err
+// uiTLS is the TLS config of the web UI, nil for plain HTTP.
+func uiTLS(o options, panelCert *keys.Cert) (*tls.Config, error) {
+	cert := panelCert
+	switch {
+	case o.tlsCert != "":
+		var err error
+		if cert, err = keys.LoadCert(o.tlsCert, o.tlsKey); err != nil {
+			return nil, err
 		}
+	case !o.tls:
+		return nil, nil
+	}
+	return &tls.Config{Certificates: []tls.Certificate{cert.TLS}, MinVersion: tls.VersionTLS12}, nil
+}
+
+// loopback reports whether addr only listens on a loopback address.
+func loopback(addr string) bool {
+	host, _, err := net.SplitHostPort(addr)
+	if err != nil {
+		return false
+	}
+	if host == "localhost" {
+		return true
+	}
+	ip, err := netip.ParseAddr(host)
+	return err == nil && ip.IsLoopback()
+}
+
+// endpoint tells nodes where to find the core's tunnel listener: the one the
+// running core uses, which a changed config file only replaces after a
+// restart.
+func endpoint(st *store.Store, tunnel *core.RunningTunnel) func(context.Context) (agent.Endpoint, error) {
+	return func(ctx context.Context) (agent.Endpoint, error) {
 		publicAddr, err := st.Setting(ctx, store.SettingAgentPublicAddr)
 		if err != nil {
 			return agent.Endpoint{}, err
@@ -251,7 +302,7 @@ func endpoint(st *store.Store, coreConfig string) func(context.Context) (agent.E
 		if err != nil {
 			return agent.Endpoint{}, err
 		}
-		return agent.Endpoint{Server: cfg.TunnelAddr(publicAddr), Fingerprint: fingerprint}, nil
+		return agent.Endpoint{Server: tunnel.Section().Addr(publicAddr), Fingerprint: fingerprint}, nil
 	}
 }
 
@@ -310,8 +361,8 @@ func initialPassword() (password string, generated bool) {
 }
 
 func setPassword(ctx context.Context, st *store.Store, username, password string) error {
-	if len(password) < 8 {
-		return errors.New("the admin password must have at least 8 characters")
+	if err := api.CheckPassword(password); err != nil {
+		return err
 	}
 	hash, err := api.HashPassword(password)
 	if err != nil {

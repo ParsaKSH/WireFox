@@ -13,6 +13,7 @@ import (
 	"net/http"
 	"net/http/cookiejar"
 	"net/http/httptest"
+	"net/netip"
 	"path/filepath"
 	"strings"
 	"sync"
@@ -20,8 +21,10 @@ import (
 	"time"
 
 	"google.golang.org/grpc"
+	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/credentials"
 	"google.golang.org/grpc/metadata"
+	"google.golang.org/grpc/status"
 
 	"github.com/ParsaKSH/WireFox/panel/internal/agent"
 	"github.com/ParsaKSH/WireFox/panel/internal/agentpb"
@@ -59,6 +62,12 @@ func (f *fakeCore) lastRequest() string {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	return f.requests[len(f.requests)-1]
+}
+
+func (f *fakeCore) requestCount() int {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return len(f.requests)
 }
 
 func (f *fakeCore) serve(w http.ResponseWriter, r *http.Request) {
@@ -108,6 +117,11 @@ func (f *fakeCore) serve(w http.ResponseWriter, r *http.Request) {
 			writeJSON(w, http.StatusOK, n)
 		case sub == "" && r.Method == http.MethodPatch:
 			_ = json.Unmarshal(body, n)
+			var patch map[string]json.RawMessage
+			_ = json.Unmarshal(body, &patch)
+			if string(patch["egress"]) == "null" {
+				n.EgressOverride = nil
+			}
 			writeJSON(w, http.StatusOK, n)
 		case sub == "" && r.Method == http.MethodDelete:
 			delete(f.nodes, id)
@@ -203,16 +217,16 @@ func newTestEnv(t *testing.T, manager core.Manager) *testEnv {
 	if err != nil {
 		t.Fatal(err)
 	}
+	tunnel, err := core.NewRunningTunnel(ctx, st, configPath)
+	if err != nil {
+		t.Fatal(err)
+	}
 
 	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
 	agents := agent.NewServer(agent.Options{
 		Store: st,
 		Endpoint: func(ctx context.Context) (agent.Endpoint, error) {
-			cfg, err := core.LoadConfig(configPath)
-			if err != nil {
-				return agent.Endpoint{}, err
-			}
-			return agent.Endpoint{Server: cfg.TunnelAddr(""), Fingerprint: "aa"}, nil
+			return agent.Endpoint{Server: tunnel.Section().Addr(""), Fingerprint: "aa"}, nil
 		},
 		Logger:         logger,
 		CommandTimeout: 300 * time.Millisecond,
@@ -225,6 +239,10 @@ func newTestEnv(t *testing.T, manager core.Manager) *testEnv {
 	go func() { _ = grpcServer.Serve(lis) }()
 	t.Cleanup(grpcServer.Stop)
 	_, grpcPort, _ := net.SplitHostPort(lis.Addr().String())
+	// Nodes can't use the 127.0.0.1 the tests reach the panel at.
+	if err := st.SetSetting(ctx, store.SettingAgentPublicAddr, net.JoinHostPort("panel.example.com", grpcPort)); err != nil {
+		t.Fatal(err)
+	}
 
 	mux := http.NewServeMux()
 	mux.Handle("/api/", New(Options{
@@ -233,6 +251,7 @@ func newTestEnv(t *testing.T, manager core.Manager) *testEnv {
 		Manager:        manager,
 		Agents:         agents,
 		Sampler:        core.NewSampler(client.Status, time.Second, nil),
+		Tunnel:         tunnel,
 		Cert:           cert,
 		CoreConfigPath: configPath,
 		CoreBinary:     "/usr/local/bin/wirefox-server",
@@ -365,7 +384,7 @@ func TestLoginLogout(t *testing.T) {
 	}
 	resp.Body.Close()
 	cookies := resp.Cookies()
-	if len(cookies) != 1 || cookies[0].Name != SessionCookie || !cookies[0].HttpOnly ||
+	if len(cookies) != 1 || cookies[0].Name != sessionCookie || !cookies[0].HttpOnly ||
 		cookies[0].SameSite != http.SameSiteStrictMode || cookies[0].MaxAge != 7*24*3600 {
 		t.Fatalf("session cookie: %+v", cookies)
 	}
@@ -470,23 +489,17 @@ func TestCreateNode(t *testing.T) {
 	e := newTestEnv(t, core.External{})
 	e.login()
 	node, key := e.createNode("office-1")
-	if node.ID != "office-1" || node.Config.Version != 1 || node.Config.PoolSize != store.DefaultPoolSize ||
-		node.Agent != nil || node.KeyCreatedAt == 0 {
+	if node.ID != "office-1" || node.Config.Version < uint64(time.Now().Add(-time.Hour).UnixMilli()) ||
+		node.Config.PoolSize != store.DefaultPoolSize || node.Agent != nil || node.KeyCreatedAt == 0 {
 		t.Fatalf("node: %+v", node)
 	}
 	_, grpcPort, _ := net.SplitHostPort(e.grpcAddr)
-	if key.Panel != net.JoinHostPort("127.0.0.1", grpcPort) || key.Fingerprint != e.cert.Fingerprint {
+	if key.Panel != net.JoinHostPort("panel.example.com", grpcPort) || key.Fingerprint != e.cert.Fingerprint {
 		t.Fatalf("key: %+v", key)
 	}
 	stored, err := e.st.Node(context.Background(), "office-1")
 	if err != nil || stored.AgentKeyHash != keys.Hash(key.Secret) || stored.Token != "core-token" {
 		t.Fatalf("stored node: %+v, %v", stored, err)
-	}
-	// The derived address became the setting.
-	var settings settings
-	e.do("GET", "/api/settings", nil, &settings)
-	if settings.AgentPublicAddr != key.Panel {
-		t.Fatalf("settings: %+v", settings)
 	}
 
 	var nodes []nodeView
@@ -495,20 +508,31 @@ func TestCreateNode(t *testing.T) {
 	}
 
 	// The agent connects with the key and appears in the node.
-	e.connectAgent(key)
+	stream := e.connectAgent(key)
 	var got nodeView
 	e.do("GET", "/api/nodes/office-1", nil, &got)
 	if got.Agent == nil || !got.Agent.Connected || got.Agent.Version != "0.1.0" || got.Agent.Interfaces == nil {
 		t.Fatalf("agent: %+v", got.Agent)
 	}
 
+	// A new key revokes everything the old one gave access to.
 	var newKey struct{ Key string }
 	if code := e.do("POST", "/api/nodes/office-1/key", nil, &newKey); code != 200 {
 		t.Fatalf("new key: %d", code)
 	}
-	if k, err := keys.Decode(newKey.Key); err != nil || k.Secret == key.Secret {
+	k, err := keys.Decode(newKey.Key)
+	if err != nil || k.Secret == key.Secret {
 		t.Fatalf("new key %+v, %v", k, err)
 	}
+	if _, err := stream.Recv(); status.Code(err) != codes.Unauthenticated {
+		t.Fatalf("old agent stream: %v", err)
+	}
+	rotated, err := e.st.Node(context.Background(), "office-1")
+	if err != nil || rotated.Token != "rotated-token" || rotated.ConfigVersion != stored.ConfigVersion+1 ||
+		rotated.AgentKeyHash != keys.Hash(k.Secret) {
+		t.Fatalf("after the new key: %+v, %v", rotated, err)
+	}
+	e.connectAgent(k)
 
 	if code := e.do("DELETE", "/api/nodes/office-1", nil, nil); code != 200 {
 		t.Fatalf("delete: %d", code)
@@ -524,7 +548,8 @@ func TestCreateNode(t *testing.T) {
 func TestPatchNodeBumpsVersionAndPushes(t *testing.T) {
 	e := newTestEnv(t, core.External{})
 	e.login()
-	_, key := e.createNode("office-1")
+	created, key := e.createNode("office-1")
+	v := created.Config.Version
 	stream := e.connectAgent(key)
 
 	var node nodeView
@@ -532,14 +557,14 @@ func TestPatchNodeBumpsVersionAndPushes(t *testing.T) {
 	if code := e.do("PATCH", "/api/nodes/office-1", patch, &node); code != 200 {
 		t.Fatalf("patch: %d", code)
 	}
-	if node.Config.Version != 2 || node.Config.PoolSize != 32 || node.Config.Egress.Interface != "eth1" {
+	if node.Config.Version != v+1 || node.Config.PoolSize != 32 || node.Config.Egress.Interface != "eth1" {
 		t.Fatalf("patched node: %+v", node.Config)
 	}
 	msg, err := stream.Recv()
 	if err != nil {
 		t.Fatal(err)
 	}
-	if cfg := msg.GetConfig(); cfg.GetVersion() != 2 || cfg.GetPoolSize() != 32 || cfg.GetEgress().GetInterface() != "eth1" {
+	if cfg := msg.GetConfig(); cfg.GetVersion() != v+1 || cfg.GetPoolSize() != 32 || cfg.GetEgress().GetInterface() != "eth1" {
 		t.Fatalf("pushed: %v", msg)
 	}
 
@@ -547,7 +572,7 @@ func TestPatchNodeBumpsVersionAndPushes(t *testing.T) {
 	if code := e.do("PATCH", "/api/nodes/office-1", map[string]string{"name": "Office"}, &node); code != 200 {
 		t.Fatalf("rename: %d", code)
 	}
-	if node.Name != "Office" || node.Config.Version != 2 || e.core.lastRequest() != `PATCH /api/v1/nodes/office-1 {"name":"Office"}` {
+	if node.Name != "Office" || node.Config.Version != v+1 || e.core.lastRequest() != `PATCH /api/v1/nodes/office-1 {"name":"Office"}` {
 		t.Fatalf("renamed: %+v, core saw %s", node, e.core.lastRequest())
 	}
 
@@ -555,10 +580,10 @@ func TestPatchNodeBumpsVersionAndPushes(t *testing.T) {
 	if code := e.do("PATCH", "/api/nodes/office-1", map[string]bool{"enabled": false}, &node); code != 200 {
 		t.Fatalf("disable: %d", code)
 	}
-	if node.Enabled || node.Config.Version != 3 {
+	if node.Enabled || node.Config.Version != v+2 {
 		t.Fatalf("disabled: %+v", node)
 	}
-	if msg, err = stream.Recv(); err != nil || msg.GetConfig().GetEnabled() || msg.GetConfig().GetVersion() != 3 {
+	if msg, err = stream.Recv(); err != nil || msg.GetConfig().GetEnabled() || msg.GetConfig().GetVersion() != v+2 {
 		t.Fatalf("pushed: %v, %v", msg, err)
 	}
 
@@ -739,5 +764,210 @@ func TestSettingsAndEvents(t *testing.T) {
 	if code := e.do("GET", "/api/events?limit=1", nil, &events); code != 200 || len(events) != 1 ||
 		events[0].Message != "node office-1 created" {
 		t.Fatalf("events: %d %+v", code, events)
+	}
+}
+
+func TestNodeKeyAddress(t *testing.T) {
+	e := newTestEnv(t, core.External{})
+	e.login()
+	if err := e.st.SetSetting(context.Background(), store.SettingAgentPublicAddr, ""); err != nil {
+		t.Fatal(err)
+	}
+	// The tests reach the panel at 127.0.0.1, which nodes elsewhere can't.
+	var errResp struct{ Error string }
+	if code := e.do("POST", "/api/nodes", map[string]string{"id": "office-1"}, &errResp); code != http.StatusConflict ||
+		!strings.Contains(errResp.Error, "Settings") {
+		t.Fatalf("loopback host: %d %+v", code, errResp)
+	}
+	if n := e.core.requestCount(); n != 0 {
+		t.Fatalf("core saw %d requests", n)
+	}
+
+	// A host nodes can reach becomes the agent address.
+	req, _ := http.NewRequest("POST", e.srv.URL+"/api/nodes", strings.NewReader(`{"id":"office-1"}`))
+	req.Host = "panel.example.com:8080"
+	req.Header.Set("Content-Type", "application/json")
+	// The jar would pick cookies by Host.
+	for _, c := range e.client.Jar.Cookies(req.URL) {
+		req.AddCookie(c)
+	}
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp.Body.Close()
+	var created struct{ Key string }
+	if err := json.NewDecoder(resp.Body).Decode(&created); err != nil || resp.StatusCode != 200 {
+		t.Fatalf("create: %d, %v", resp.StatusCode, err)
+	}
+	key, err := keys.Decode(created.Key)
+	_, grpcPort, _ := net.SplitHostPort(e.grpcAddr)
+	if err != nil || key.Panel != net.JoinHostPort("panel.example.com", grpcPort) {
+		t.Fatalf("key: %+v, %v", key, err)
+	}
+	var settings settings
+	if e.do("GET", "/api/settings", nil, &settings); settings.AgentPublicAddr != key.Panel {
+		t.Fatalf("settings: %+v", settings)
+	}
+}
+
+func TestAdoptedNodeLosesEgressOverride(t *testing.T) {
+	e := newTestEnv(t, core.External{})
+	e.login()
+	e.core.mu.Lock()
+	e.core.nodes["legacy"] = &core.Node{ID: "legacy", Name: "legacy", Enabled: true,
+		EgressOverride: &core.Egress{Interface: "wlan0"}}
+	e.core.mu.Unlock()
+
+	var before nodeView
+	if code := e.do("GET", "/api/nodes/legacy", nil, &before); code != 200 || before.Core.EgressOverride == nil ||
+		before.Core.EgressOverride.Interface != "wlan0" {
+		t.Fatalf("before adoption: %d %+v", code, before.Core)
+	}
+	var node nodeView
+	if code := e.do("PATCH", "/api/nodes/legacy", map[string]int{"pool_size": 8}, &node); code != 200 {
+		t.Fatalf("patch: %d", code)
+	}
+	if node.Core.EgressOverride != nil || node.Config.PoolSize != 8 {
+		t.Fatalf("adopted: %+v", node)
+	}
+	if got := e.core.lastRequest(); got != `PATCH /api/v1/nodes/legacy {"egress":null}` {
+		t.Fatalf("core saw %s", got)
+	}
+}
+
+func TestDotsOnlyIDsRefused(t *testing.T) {
+	e := newTestEnv(t, core.External{})
+	e.login()
+	for _, id := range []string{".", ".."} {
+		if code := e.do("POST", "/api/nodes", map[string]string{"id": id}, nil); code != 400 {
+			t.Errorf("node %q: %d", id, code)
+		}
+		if code := e.do("POST", "/api/users", map[string]string{"username": id}, nil); code != 400 {
+			t.Errorf("user %q: %d", id, code)
+		}
+	}
+	if n := e.core.requestCount(); n != 0 {
+		t.Fatalf("core saw %d requests", n)
+	}
+}
+
+func TestTunnelChangeWaitsForRestart(t *testing.T) {
+	e := newTestEnv(t, &fakeManager{})
+	e.login()
+	ctx := context.Background()
+	created, key := e.createNode("office-1")
+	stream := e.connectAgent(key)
+	if err := e.agents.SyncEndpoint(ctx); err != nil {
+		t.Fatal(err)
+	}
+
+	var info struct{ Config coreConfig }
+	e.do("GET", "/api/core", nil, &info)
+	cfg := info.Config
+	cfg.TunnelPublicAddr = "relay.example.com:8443"
+	var resp struct {
+		RestartRequired bool `json:"restart_required"`
+	}
+	if code := e.do("PUT", "/api/core/config", cfg, &resp); code != 200 || !resp.RestartRequired {
+		t.Fatalf("put: %d %+v", code, resp)
+	}
+	// The running core still listens where it did, also at the next poll.
+	if err := e.agents.SyncEndpoint(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if n, _ := e.st.Node(ctx, "office-1"); n.ConfigVersion != created.Config.Version {
+		t.Fatalf("version bumped to %d before the restart", n.ConfigVersion)
+	}
+
+	if code := e.do("POST", "/api/core/restart", nil, nil); code != 200 {
+		t.Fatalf("restart: %d", code)
+	}
+	msg, err := stream.Recv()
+	if err != nil || msg.GetConfig().GetServer() != "relay.example.com:8443" {
+		t.Fatalf("after the restart: %v, %v", msg, err)
+	}
+}
+
+func TestLoginLimitHoldsForParallelGuesses(t *testing.T) {
+	e := newTestEnv(t, core.External{})
+	const guesses = 40
+	var wg sync.WaitGroup
+	var mu sync.Mutex
+	answers := map[int]int{}
+	for range guesses {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			body := strings.NewReader(`{"username":"admin","password":"guess"}`)
+			resp, err := http.Post(e.srv.URL+"/api/login", "application/json", body)
+			if err != nil {
+				t.Error(err)
+				return
+			}
+			resp.Body.Close()
+			mu.Lock()
+			answers[resp.StatusCode]++
+			mu.Unlock()
+		}()
+	}
+	wg.Wait()
+	if answers[401] > maxLoginFailures || answers[401]+answers[429] != guesses {
+		t.Fatalf("answers: %v", answers)
+	}
+}
+
+func TestLimiterKey(t *testing.T) {
+	key := func(s string) string { return limiterKey(netip.MustParseAddr(s)) }
+	if key("2001:db8::1") != key("2001:db8::abcd:1") {
+		t.Error("addresses of one /64 are counted apart")
+	}
+	if key("2001:db8::1") == key("2001:db8:0:1::1") {
+		t.Error("different /64s are counted together")
+	}
+	if key("192.0.2.1") == key("192.0.2.2") {
+		t.Error("IPv4 addresses are counted together")
+	}
+}
+
+func TestTrustedProxies(t *testing.T) {
+	if _, err := ParseProxies("10.0.0.0/8,nonsense"); err == nil {
+		t.Fatal("parsed a bad CIDR")
+	}
+	proxies, err := ParseProxies(" 10.0.0.0/8, 192.0.2.1 ")
+	if err != nil {
+		t.Fatal(err)
+	}
+	request := func(remote string) *http.Request {
+		r := httptest.NewRequest("POST", "/api/login", nil)
+		r.RemoteAddr = remote
+		r.Header.Add("X-Forwarded-For", "203.0.113.9, 198.51.100.7")
+		r.Header.Add("X-Forwarded-For", "10.1.2.3")
+		r.Header.Set("X-Forwarded-Proto", "https")
+		r.Header.Set("X-Forwarded-Host", "panel.example.com")
+		return r
+	}
+
+	behind := request("192.0.2.1:40000")
+	if got := proxies.clientIP(behind); got != netip.MustParseAddr("198.51.100.7") {
+		t.Errorf("client behind the proxies: %s", got)
+	}
+	if !proxies.https(behind) || proxies.host(behind) != "panel.example.com" {
+		t.Error("forwarded proto or host ignored")
+	}
+	a := &API{Options: Options{TrustedProxies: proxies}}
+	if !a.sessionCookie(behind, "x", 1).Secure {
+		t.Error("session cookie not Secure behind a TLS proxy")
+	}
+
+	direct := request("198.51.100.1:40000")
+	if got := proxies.clientIP(direct); got != netip.MustParseAddr("198.51.100.1") {
+		t.Errorf("client without a proxy: %s", got)
+	}
+	if proxies.https(direct) || proxies.host(direct) != direct.Host || a.sessionCookie(direct, "x", 1).Secure {
+		t.Error("forwarding headers believed from an untrusted peer")
+	}
+	if got := Proxies(nil).clientIP(behind); got != netip.MustParseAddr("192.0.2.1") {
+		t.Errorf("no trusted proxies: %s", got)
 	}
 }

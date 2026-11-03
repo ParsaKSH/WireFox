@@ -2,7 +2,9 @@ package api
 
 import (
 	"errors"
+	"fmt"
 	"net/http"
+	"net/netip"
 	"sync"
 	"time"
 
@@ -13,29 +15,43 @@ import (
 )
 
 const (
-	SessionCookie = "wirefox_session"
+	sessionCookie = "wirefox_session"
 	sessionTTL    = 7 * 24 * time.Hour
 	// bcrypt ignores everything past 72 bytes.
 	maxPasswordLen = 72
 	minPasswordLen = 8
+
+	// A client is turned away after this many failed logins in the window.
+	maxLoginFailures   = 10
+	loginFailureWindow = 5 * time.Minute
+	// Logins beyond this many at once are refused rather than queued.
+	maxConcurrentLogins = 4
+	// The limiter prunes stale clients once it tracks more than this.
+	limiterPruneSize = 10000
 )
 
 // Compared against when the username is unknown, so a login takes as long
 // whether or not the user exists.
 var dummyHash, _ = bcrypt.GenerateFromPassword([]byte("wirefox-panel"), bcrypt.DefaultCost)
 
-// HashPassword hashes an admin password for storage.
-func HashPassword(password string) (string, error) {
-	if len(password) > maxPasswordLen {
-		return "", errors.New("password must be at most 72 bytes")
+// CheckPassword applies the rules for admin passwords.
+func CheckPassword(password string) error {
+	if len(password) < minPasswordLen || len(password) > maxPasswordLen {
+		return fmt.Errorf("the password must be %d to %d bytes long", minPasswordLen, maxPasswordLen)
 	}
+	return nil
+}
+
+// HashPassword hashes an admin password, checked with CheckPassword, for
+// storage.
+func HashPassword(password string) (string, error) {
 	hash, err := bcrypt.GenerateFromPassword([]byte(password), bcrypt.DefaultCost)
 	return string(hash), err
 }
 
 func (a *API) requireSession(h func(http.ResponseWriter, *http.Request, string)) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		cookie, err := r.Cookie(SessionCookie)
+		cookie, err := r.Cookie(sessionCookie)
 		if err != nil || cookie.Value == "" {
 			writeError(w, http.StatusUnauthorized, "not logged in")
 			return
@@ -54,8 +70,11 @@ func (a *API) requireSession(h func(http.ResponseWriter, *http.Request, string))
 }
 
 func (a *API) login(w http.ResponseWriter, r *http.Request) {
-	ip := clientIP(r)
-	if a.logins.blocked(ip) {
+	ip := a.TrustedProxies.clientIP(r)
+	client := limiterKey(ip)
+	// Counted as a failure until it succeeds, so guesses sent in parallel
+	// can't slip past the limit while bcrypt runs.
+	if !a.logins.attempt(client) {
 		writeError(w, http.StatusTooManyRequests, "too many failed logins, try again later")
 		return
 	}
@@ -64,6 +83,13 @@ func (a *API) login(w http.ResponseWriter, r *http.Request) {
 		Password string `json:"password"`
 	}
 	if !decode(w, r, &req) {
+		return
+	}
+	select {
+	case a.bcryptSlots <- struct{}{}:
+		defer func() { <-a.bcryptSlots }()
+	default:
+		writeError(w, http.StatusTooManyRequests, "too many logins at once, try again later")
 		return
 	}
 	ctx := r.Context()
@@ -76,12 +102,11 @@ func (a *API) login(w http.ResponseWriter, r *http.Request) {
 		hash = string(dummyHash)
 	}
 	if bcrypt.CompareHashAndPassword([]byte(hash), []byte(req.Password)) != nil || err != nil {
-		a.logins.fail(ip)
 		a.log.Warn("failed panel login", "username", req.Username, "remote", ip)
 		writeError(w, http.StatusUnauthorized, "wrong username or password")
 		return
 	}
-	a.logins.reset(ip)
+	a.logins.reset(client)
 
 	now := time.Now()
 	if err := a.Store.PurgeExpiredSessions(ctx, now); err != nil {
@@ -92,29 +117,30 @@ func (a *API) login(w http.ResponseWriter, r *http.Request) {
 		a.internalError(w, r, err)
 		return
 	}
-	http.SetCookie(w, a.sessionCookie(token, int(sessionTTL/time.Second)))
+	http.SetCookie(w, a.sessionCookie(r, token, int(sessionTTL/time.Second)))
 	writeJSON(w, http.StatusOK, map[string]string{"username": req.Username})
 }
 
-func (a *API) sessionCookie(value string, maxAge int) *http.Cookie {
+// sessionCookie is Secure when the browser reached the panel over HTTPS.
+func (a *API) sessionCookie(r *http.Request, value string, maxAge int) *http.Cookie {
 	return &http.Cookie{
-		Name:     SessionCookie,
+		Name:     sessionCookie,
 		Value:    value,
 		Path:     "/",
 		MaxAge:   maxAge,
 		HttpOnly: true,
-		Secure:   a.SecureCookies,
+		Secure:   a.TrustedProxies.https(r),
 		SameSite: http.SameSiteStrictMode,
 	}
 }
 
 func (a *API) logout(w http.ResponseWriter, r *http.Request, _ string) {
-	cookie, _ := r.Cookie(SessionCookie)
+	cookie, _ := r.Cookie(sessionCookie)
 	if err := a.Store.DeleteSession(r.Context(), keys.Hash(cookie.Value)); err != nil {
 		a.internalError(w, r, err)
 		return
 	}
-	http.SetCookie(w, a.sessionCookie("", -1))
+	http.SetCookie(w, a.sessionCookie(r, "", -1))
 	writeOK(w)
 }
 
@@ -130,8 +156,8 @@ func (a *API) changePassword(w http.ResponseWriter, r *http.Request, username st
 	if !decode(w, r, &req) {
 		return
 	}
-	if len(req.New) < minPasswordLen || len(req.New) > maxPasswordLen {
-		writeError(w, http.StatusBadRequest, "the new password must be 8 to 72 characters")
+	if err := CheckPassword(req.New); err != nil {
+		writeError(w, http.StatusBadRequest, err.Error())
 		return
 	}
 	ctx := r.Context()
@@ -154,7 +180,7 @@ func (a *API) changePassword(w http.ResponseWriter, r *http.Request, username st
 		return
 	}
 	// Log out everywhere else.
-	cookie, _ := r.Cookie(SessionCookie)
+	cookie, _ := r.Cookie(sessionCookie)
 	if err := a.Store.DeleteUserSessions(ctx, username, keys.Hash(cookie.Value)); err != nil {
 		a.internalError(w, r, err)
 		return
@@ -192,27 +218,38 @@ func (l *failureLimiter) recent(key string, now time.Time) []time.Time {
 	return times
 }
 
-func (l *failureLimiter) blocked(key string) bool {
-	l.mu.Lock()
-	defer l.mu.Unlock()
-	return len(l.recent(key, time.Now())) >= l.max
-}
-
-func (l *failureLimiter) fail(key string) {
+// attempt records a failure for key up front, unless key is already blocked;
+// it reports whether the attempt may go ahead. reset clears key after a
+// success.
+func (l *failureLimiter) attempt(key string) bool {
 	l.mu.Lock()
 	defer l.mu.Unlock()
 	now := time.Now()
-	l.failures[key] = append(l.recent(key, now), now)
+	recent := l.recent(key, now)
+	if len(recent) >= l.max {
+		return false
+	}
+	l.failures[key] = append(recent, now)
 	// Keep the map from growing without bound under a spray of addresses.
-	if len(l.failures) > 10000 {
+	if len(l.failures) > limiterPruneSize {
 		for k := range l.failures {
 			l.recent(k, now)
 		}
 	}
+	return true
 }
 
 func (l *failureLimiter) reset(key string) {
 	l.mu.Lock()
 	defer l.mu.Unlock()
 	delete(l.failures, key)
+}
+
+// limiterKey groups IPv6 clients by /64, the block a single host usually
+// has to pick addresses from.
+func limiterKey(ip netip.Addr) string {
+	if ip.Is6() {
+		return netip.PrefixFrom(ip, 64).Masked().String()
+	}
+	return ip.String()
 }
