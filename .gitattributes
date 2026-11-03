@@ -1,0 +1,4 @@
+# Stored with CRLF as-is: raw.githubusercontent.com serves the stored bytes,
+# and cmd.exe misparses batch files with bare LF line endings.
+*.bat -text
+*.sh text eol=lf

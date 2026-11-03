@@ -28,7 +28,21 @@ browser ──HTTP(S)──▶ wirefox-panel ──REST (127.0.0.1)──▶ wir
 
 ## Install
 
-The panel manages a systemd service and writes to `/etc`, so it runs as root.
+The installer downloads the latest release, checks its checksums, installs the
+panel and the core, creates the admin account and prints the URL and password:
+
+```bash
+bash <(curl -fsSL https://raw.githubusercontent.com/ParsaKSH/WireFox/main/scripts/install-panel.sh)
+```
+
+By default the web UI listens on a random port on all interfaces over HTTPS
+with the panel's self-signed certificate; `--local` keeps it on `127.0.0.1`
+for an SSH tunnel instead. Run it again to upgrade (settings and data are
+kept), or with `--uninstall`. `--help` lists the options, including `--mirror`
+for servers that can't reach GitHub.
+
+To install by hand instead: the panel manages a systemd service and writes to
+`/etc`, so it runs as root.
 
 ```bash
 install -m 755 wirefox-panel wirefox-server /usr/local/bin/
@@ -94,10 +108,22 @@ tunnel port (`7443`) for nodes, and the SOCKS ports (`1080`, `1443`) for users.
    a different name than the server's listen address.
 3. In **Nodes**, click *Add node*. The key is shown once, with ready-made setup
    steps for Linux (systemd), Windows and OpenWrt.
-4. On the node, give `wirefox-node run` the key in `WIREFOX_NODE_KEY`, never on
-   its command line, where other users could read it. On Linux that's
-   `/etc/wirefox/node.env` (mode 600) with `WIREFOX_NODE_KEY=<KEY>`, loaded by
-   `examples/wirefox-node-managed.service`.
+4. On the node, run the installer as root (Administrator on Windows) and paste
+   the key when it asks:
+
+   ```bash
+   sh -c "$(curl -fsSL https://raw.githubusercontent.com/ParsaKSH/WireFox/main/scripts/install-node.sh)"   # Linux
+   sh -c "$(wget -qO- https://raw.githubusercontent.com/ParsaKSH/WireFox/main/scripts/install-node.sh)"    # OpenWrt
+   ```
+
+   On Windows, download and run
+   [`scripts/install-node.bat`](../scripts/install-node.bat). The installers set
+   up a service that starts at boot and confirm the node reached the panel.
+
+   By hand, give `wirefox-node run` the key in `WIREFOX_NODE_KEY` or in a file
+   (`--key-file`), never on its command line, where other users could read it.
+   On Linux that's `/etc/wirefox/node.env` (mode 600) with
+   `WIREFOX_NODE_KEY=<KEY>`, loaded by `examples/wirefox-node-managed.service`.
 
 The node saves the settings it receives under `/var/lib/wirefox-node`
 (`%ProgramData%\wirefox-node` on Windows, `/etc/wirefox-node` in the OpenWrt
