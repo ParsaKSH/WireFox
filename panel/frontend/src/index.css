@@ -1,0 +1,70 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+:root {
+  color-scheme: dark;
+}
+
+html,
+body,
+#root {
+  height: 100%;
+}
+
+body {
+  @apply bg-ink-900 text-slate-200 antialiased;
+  background-image:
+    radial-gradient(1000px 520px at 105% -15%, rgba(249, 115, 22, 0.09), transparent),
+    radial-gradient(760px 520px at -15% 110%, rgba(245, 158, 11, 0.05), transparent);
+  background-attachment: fixed;
+}
+
+::-webkit-scrollbar {
+  width: 10px;
+  height: 10px;
+}
+::-webkit-scrollbar-thumb {
+  @apply rounded-full bg-ink-500;
+}
+::-webkit-scrollbar-track {
+  background: transparent;
+}
+
+@layer components {
+  .card {
+    @apply rounded-2xl border border-ink-600/70 bg-ink-800/70 backdrop-blur-sm;
+  }
+  .input {
+    @apply w-full rounded-lg border border-ink-500/70 bg-ink-900/70 px-3 py-2 text-sm text-slate-100
+      placeholder-slate-500 outline-none transition
+      focus:border-fox-500 focus:ring-2 focus:ring-fox-500/25
+      disabled:cursor-not-allowed disabled:opacity-50;
+  }
+  .label {
+    @apply mb-1.5 block text-xs font-medium text-slate-400;
+  }
+  .btn {
+    @apply inline-flex items-center justify-center gap-2 whitespace-nowrap rounded-lg px-3.5 py-2 text-sm font-medium
+      transition active:scale-[0.98] disabled:pointer-events-none disabled:opacity-40
+      focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-fox-500/40;
+  }
+  .btn-primary {
+    @apply btn bg-fox-600 text-white shadow-glow hover:bg-fox-500;
+  }
+  .btn-ghost {
+    @apply btn border border-ink-500/60 bg-ink-600/60 text-slate-200 hover:bg-ink-500/70;
+  }
+  .btn-danger {
+    @apply btn bg-rose-600/90 text-white hover:bg-rose-500;
+  }
+  .btn-sm {
+    @apply px-2.5 py-1.5 text-xs;
+  }
+  .th {
+    @apply whitespace-nowrap px-4 py-2.5 text-left text-[11px] font-medium uppercase tracking-wide text-slate-500;
+  }
+  .td {
+    @apply px-4 py-2.5 align-middle;
+  }
+}
