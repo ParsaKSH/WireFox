@@ -1,22 +1,11 @@
 import { useCallback, useState } from "react";
 import { History, RefreshCw } from "lucide-react";
 import { api } from "../api";
-import { useResource, useTicker } from "../hooks";
+import { fmtAgo, fmtDateTime } from "../format";
+import { POLL_SLOW_MS, useResource, useTicker } from "../hooks";
 import { EVENT_TONES } from "../status";
 import type { EventLevel, PanelEvent } from "../types";
-import {
-  Badge,
-  EmptyState,
-  ErrorState,
-  fmtAgo,
-  fmtDateTime,
-  LoadingState,
-  PageHeader,
-  Select,
-  Spinner,
-  StatusDot,
-  TableCard,
-} from "../ui";
+import { Badge, EmptyState, ErrorState, LoadingState, PageHeader, Select, Spinner, StatusDot, TableCard } from "../ui";
 
 // Compact list used on the dashboard.
 export function EventList({ events }: { events: PanelEvent[] }) {
@@ -51,7 +40,7 @@ export function ActivityView() {
   const [limit, setLimit] = useState<Limit>("100");
   const [level, setLevel] = useState<LevelFilter>("all");
   const load = useCallback(() => api.events(Number(limit)), [limit]);
-  const events = useResource(load, 10000);
+  const events = useResource(load, POLL_SLOW_MS);
   const { reload } = events;
 
   const shown = (events.data ?? []).filter((e) => level === "all" || e.level === level);

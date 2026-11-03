@@ -13,20 +13,17 @@ import {
   Undo2,
 } from "lucide-react";
 import { api, errorMessage } from "../api";
-import { useResource } from "../hooks";
+import { cls, fmtAgo, fmtClock, fmtDateTime } from "../format";
+import { POLL_MS, useResource } from "../hooks";
 import { PRIORITY_NAMES, priorityClass, unitTone } from "../status";
 import { BALANCES, type Balance, type CoreConfig, type CoreInfo } from "../types";
 import {
   Badge,
   Banner,
-  cls,
   ConfirmDialog,
   CopyButton,
   ErrorState,
   Field,
-  fmtAgo,
-  fmtClock,
-  fmtDateTime,
   IconButton,
   LoadingState,
   PageHeader,
@@ -36,6 +33,7 @@ import {
   StatusDot,
   Toggle,
   useToast,
+  type Tone,
 } from "../ui";
 
 type Action = "start" | "stop" | "restart";
@@ -46,7 +44,7 @@ const RESTART_KEY = "wirefox.core.restartRequired";
 
 export function Core() {
   const toast = useToast();
-  const core = useResource(api.core, 5000);
+  const core = useResource(api.core, POLL_MS);
   const [restartRequired, setRestartRequired] = useState(() => sessionStorage.getItem(RESTART_KEY) === "1");
   const [confirming, setConfirming] = useState<Action | null>(null);
   const [running, setRunning] = useState<Action | null>(null);
@@ -174,8 +172,20 @@ function StatusCard({
   running: Action | null;
   onAction: (a: Action) => void;
 }) {
+  const managed = info.mode === "systemd";
   const unit = info.unit;
-  const active = unit?.active_state === "active";
+  // Without a unit state (systemctl failed) every action stays available.
+  const state = unit?.active_state;
+  const active = state === "active";
+  let headline = "external";
+  let tone: Tone = info.reachable ? "green" : "red";
+  if (unit) {
+    headline = `${unit.active_state}${unit.sub_state ? ` (${unit.sub_state})` : ""}`;
+    tone = unitTone(unit.active_state);
+  } else if (managed) {
+    headline = "unit status unavailable";
+    tone = "amber";
+  }
   return (
     <div className="grid grid-cols-1 gap-6 xl:grid-cols-2">
       <div>
@@ -183,13 +193,11 @@ function StatusCard({
         <div className="card p-5">
           <div className="mb-4 flex flex-wrap items-center justify-between gap-3">
             <div className="flex items-center gap-2.5">
-              <StatusDot tone={unit ? unitTone(unit.active_state) : info.reachable ? "green" : "red"} pulse={active} />
-              <span className="text-lg font-semibold text-slate-100">
-                {unit ? `${unit.active_state}${unit.sub_state ? ` (${unit.sub_state})` : ""}` : "external"}
-              </span>
-              <Badge tone={info.mode === "systemd" ? "fox" : "slate"}>{info.mode}</Badge>
+              <StatusDot tone={tone} pulse={active} />
+              <span className="text-lg font-semibold text-slate-100">{headline}</span>
+              <Badge tone={managed ? "fox" : "slate"}>{info.mode}</Badge>
             </div>
-            {unit && (
+            {managed && (
               <div className="flex gap-2">
                 <button className="btn-ghost btn-sm" disabled={!!running || active} onClick={() => onAction("start")}>
                   {running === "start" ? <Spinner className="h-3.5 w-3.5" /> : <Play className="h-3.5 w-3.5" />} Start
@@ -198,13 +206,24 @@ function StatusCard({
                   {running === "restart" ? <Spinner className="h-3.5 w-3.5" /> : <RotateCw className="h-3.5 w-3.5" />}{" "}
                   Restart
                 </button>
-                <button className="btn-ghost btn-sm" disabled={!!running || !active} onClick={() => onAction("stop")}>
+                {/* Also enabled while the unit fails or waits to be restarted, so a crash loop can be stopped here. */}
+                <button
+                  className="btn-ghost btn-sm"
+                  disabled={!!running || state === "inactive"}
+                  onClick={() => onAction("stop")}
+                >
                   {running === "stop" ? <Spinner className="h-3.5 w-3.5" /> : <Square className="h-3.5 w-3.5" />} Stop
                 </button>
               </div>
             )}
           </div>
-          {!unit && (
+          {managed && !unit && (
+            <p className="mb-3 text-xs leading-relaxed text-amber-300/80">
+              systemctl did not report the state of the core's unit. The controls stay available; the state shows up
+              again once systemctl answers.
+            </p>
+          )}
+          {!managed && (
             <p className="mb-3 text-xs leading-relaxed text-slate-500">
               External mode: the panel writes the core's configuration and talks to its API, but the service itself is
               started and stopped outside the panel.
@@ -461,7 +480,7 @@ function ConfigCard({ info, onSaved }: { info: CoreInfo; onSaved: (restartRequir
           </Field>
           <ListEditor
             label="TLS names"
-            hint="Subject alternative names of the core's self-signed certificate. Changing them issues a new certificate and fingerprint on restart."
+            hint="Subject alternative names for the self-signed certificate the core creates when it has none. A certificate that already exists keeps its names: to issue one with these, delete server.crt and server.key in the data directory and restart the core. That changes the fingerprint, so TLS clients that pinned the old one must be updated."
             values={form.tls_sans}
             placeholder="relay.example.com"
             onChange={(v) => set("tls_sans", v)}
@@ -494,7 +513,7 @@ function LogsCard() {
   const [autoScroll, setAutoScroll] = useState(true);
   const [lines, setLines] = useState<LogLines>("200");
   const load = useCallback(() => api.coreLogs(Number(lines)), [lines]);
-  const logs = useResource(load, follow ? 5000 : undefined);
+  const logs = useResource(load, follow ? POLL_MS : undefined);
   const boxRef = useRef<HTMLDivElement>(null);
 
   useEffect(() => {

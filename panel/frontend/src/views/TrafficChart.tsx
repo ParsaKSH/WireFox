@@ -1,6 +1,6 @@
 import { useEffect, useMemo, useRef, useState, type MouseEvent } from "react";
+import { fmtDuration, fmtRate } from "../format";
 import type { HistorySample } from "../types";
-import { fmtRate } from "../ui";
 
 // Colors checked for lightness, color-blind separation and contrast on the ink surface.
 const DOWN = "#ea580c";
@@ -21,6 +21,22 @@ export function rateTicks(max: number): number[] {
   for (let v = 0; v <= max + step * 0.001; v += step) ticks.push(v);
   if (ticks[ticks.length - 1] < max) ticks.push(ticks[ticks.length - 1] + step);
   return ticks;
+}
+
+// Steps for the time axis, in seconds.
+const TIME_STEPS = [1, 2, 5, 10, 15, 30, 60, 120, 300, 600, 900, 1800, 3600, 7200, 10800, 21600, 43200, 86400];
+
+// Picks time-axis ticks between t0 and t1 (Unix seconds): at most maxCount of
+// them, on round local-clock steps. Labels need seconds when the step is
+// shorter than a minute; otherwise HH:MM is already distinct.
+export function timeTicks(t0: number, t1: number, maxCount: number): { ticks: number[]; seconds: boolean } {
+  const span = Math.max(1, t1 - t0);
+  const step = TIME_STEPS.find((s) => span / s < Math.max(2, maxCount)) ?? TIME_STEPS[TIME_STEPS.length - 1];
+  // Align to the local clock, so hourly ticks land on :00 in every time zone.
+  const shift = -new Date(t0 * 1000).getTimezoneOffset() * 60;
+  const ticks: number[] = [];
+  for (let t = Math.ceil((t0 + shift) / step) * step - shift; t <= t1; t += step) ticks.push(t);
+  return { ticks, seconds: step < 60 };
 }
 
 function clock(t: number, seconds = false): string {
@@ -61,13 +77,13 @@ export function TrafficChart({ history }: { history: HistorySample[] }) {
       history.map((s, i) => `${i ? "L" : "M"}${x(s.t).toFixed(1)},${y(pick(s)).toFixed(1)}`).join("");
     const area = (pick: (s: HistorySample) => number) =>
       `${line(pick)}L${x(t1).toFixed(1)},${y(0)}L${x(t0).toFixed(1)},${y(0)}Z`;
-    const timeTicks = Array.from({ length: 5 }, (_, i) => t0 + (span * i) / 4);
     return {
       innerW,
       x,
       y,
       ticks,
-      timeTicks,
+      // Roughly one label per 90 px, which fits HH:MM:SS with room to spare.
+      time: timeTicks(t0, t1, Math.floor(innerW / 90)),
       downLine: line((s) => s.down_bps),
       downArea: area((s) => s.down_bps),
       upLine: line((s) => s.up_bps),
@@ -111,7 +127,7 @@ export function TrafficChart({ history }: { history: HistorySample[] }) {
             width={width}
             height={HEIGHT}
             role="img"
-            aria-label={`Traffic over the last ${Math.round((last.t - history[0].t) / 60)} minutes. Now ${fmtRate(last.down_bps)} down, ${fmtRate(last.up_bps)} up.`}
+            aria-label={`Traffic over the last ${fmtDuration(last.t - history[0].t)}. Now ${fmtRate(last.down_bps)} down, ${fmtRate(last.up_bps)} up.`}
             onMouseMove={onMove}
             onMouseLeave={() => setHover(null)}
           >
@@ -130,17 +146,16 @@ export function TrafficChart({ history }: { history: HistorySample[] }) {
                 </text>
               </g>
             ))}
-            {geo.timeTicks.map((t, i) => (
-              <text
-                key={t}
-                x={geo.x(t)}
-                y={HEIGHT - 8}
-                textAnchor={i === 0 ? "start" : i === geo.timeTicks.length - 1 ? "end" : "middle"}
-                className="fill-slate-500 text-[10px]"
-              >
-                {clock(t)}
-              </text>
-            ))}
+            {geo.time.ticks.map((t) => {
+              // Labels near the plot edges are anchored inwards so they aren't clipped.
+              const x = geo.x(t);
+              const anchor = x < PAD.left + 24 ? "start" : x > PAD.left + geo.innerW - 24 ? "end" : "middle";
+              return (
+                <text key={t} x={x} y={HEIGHT - 8} textAnchor={anchor} className="fill-slate-500 text-[10px]">
+                  {clock(t, geo.time.seconds)}
+                </text>
+              );
+            })}
             <path d={geo.downArea} fill={DOWN} fillOpacity={0.16} />
             <path d={geo.upArea} fill={UP} fillOpacity={0.16} />
             <path d={geo.downLine} fill="none" stroke={DOWN} strokeWidth={2} strokeLinejoin="round" />

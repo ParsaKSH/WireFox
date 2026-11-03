@@ -14,7 +14,8 @@ import {
   Trash2,
 } from "lucide-react";
 import { api, errorMessage } from "../api";
-import { useResource, useTicker } from "../hooks";
+import { fmtAgo, fmtBytes, fmtDateTime, fmtDuration } from "../format";
+import { POLL_MS, useResource, useTicker } from "../hooks";
 import { agentState, TUNNEL_TONES } from "../status";
 import type { Binding, Node } from "../types";
 import {
@@ -22,10 +23,6 @@ import {
   ConfirmDialog,
   EmptyState,
   ErrorState,
-  fmtAgo,
-  fmtBytes,
-  fmtDateTime,
-  fmtDuration,
   IconButton,
   LoadingState,
   Menu,
@@ -64,9 +61,16 @@ function AgentCell({ node }: { node: Node }) {
       {a && (
         <div className="flex items-center gap-1.5 text-xs">
           {a.connected ? (
-            <Badge tone={TUNNEL_TONES[a.tunnel_state]} title={a.last_error || undefined}>
-              tunnel {a.tunnel_state}
-            </Badge>
+            <>
+              <Badge tone={TUNNEL_TONES[a.tunnel_state]} title={a.last_error || undefined}>
+                tunnel {a.tunnel_state}
+              </Badge>
+              {a.connected_secs > 0 && (
+                <span className="whitespace-nowrap text-slate-500" title="Time since the tunnel last connected">
+                  for {fmtDuration(a.connected_secs)}
+                </span>
+              )}
+            </>
           ) : (
             <span className="text-slate-500" title={fmtDateTime(a.last_seen)}>
               seen {fmtAgo(a.last_seen)}
@@ -123,13 +127,13 @@ function HostCell({ node }: { node: Node }) {
 export function Nodes() {
   useTicker(5000);
   const toast = useToast();
-  const nodes = useResource(api.nodes, 5000);
+  const nodes = useResource(api.nodes, POLL_MS);
   const [dialog, setDialog] = useState<Dialog | null>(null);
   const [busy, setBusy] = useState<string | null>(null);
 
-  const replace = (fresh: Node) => {
-    if (nodes.data) nodes.set(nodes.data.map((n) => (n.id === fresh.id ? fresh : n)));
-  };
+  // Mutations finish after an await, so they merge into whatever the list is by
+  // then rather than into the one their row was rendered from.
+  const replace = (fresh: Node) => nodes.set((cur) => cur.map((n) => (n.id === fresh.id ? fresh : n)));
 
   // Runs a row action, tracking it per node so its row can show a spinner.
   const act = async (node: Node, what: string, fn: () => Promise<void>) => {
@@ -153,7 +157,9 @@ export function Nodes() {
   const refreshInterfaces = (node: Node) =>
     act(node, "interfaces", async () => {
       const { interfaces } = await api.nodeInterfaces(node.id);
-      if (node.agent) replace({ ...node, agent: { ...node.agent, interfaces } });
+      nodes.set((cur) =>
+        cur.map((n) => (n.id === node.id && n.agent ? { ...n, agent: { ...n.agent, interfaces } } : n)),
+      );
       toast(
         "success",
         `${node.id} reported ${interfaces.length} ${interfaces.length === 1 ? "interface" : "interfaces"}`,
@@ -179,7 +185,7 @@ export function Nodes() {
   const remove = async (node: Node) => {
     try {
       await api.deleteNode(node.id);
-      if (nodes.data) nodes.set(nodes.data.filter((n) => n.id !== node.id));
+      nodes.set((cur) => cur.filter((n) => n.id !== node.id));
       toast("success", `Node ${node.id} deleted`);
     } catch (e) {
       toast("error", errorMessage(e));
@@ -326,7 +332,7 @@ export function Nodes() {
         <AddNodeModal
           onClose={() => setDialog(null)}
           onCreated={(node, key) => {
-            if (nodes.data) nodes.set([...nodes.data, node].sort((a, b) => a.id.localeCompare(b.id)));
+            nodes.set((cur) => [...cur, node].sort((a, b) => a.id.localeCompare(b.id)));
             setDialog({ kind: "key", nodeId: node.id, key });
           }}
         />

@@ -51,9 +51,26 @@ describe("api client", () => {
     expect(unauthorized).not.toHaveBeenCalled();
   });
 
-  it("falls back to the status when the body is not JSON", async () => {
-    vi.stubGlobal("fetch", async () => new Response("gateway down", { status: 502, statusText: "Bad Gateway" }));
+  it("shows a plain-text error body", async () => {
+    const body = "Failed to deserialize the JSON body into the target type: max_connections: invalid value";
+    vi.stubGlobal("fetch", async () => new Response(body, { status: 422, statusText: "Unprocessable Entity" }));
+    await expect(api.updateUser("alice", { max_connections: 5000000000 })).rejects.toThrow(`422: ${body}`);
+  });
+
+  it("cuts long plain-text bodies short", async () => {
+    vi.stubGlobal("fetch", async () => new Response("x".repeat(1000), { status: 500 }));
+    const err = (await api.overview().catch((e: unknown) => e)) as ApiError;
+    expect(err.message).toBe(`500: ${"x".repeat(200)}`);
+  });
+
+  it("falls back to the status for HTML or empty bodies", async () => {
+    vi.stubGlobal(
+      "fetch",
+      async () => new Response("<html>bad gateway</html>", { status: 502, statusText: "Bad Gateway" }),
+    );
     await expect(api.overview()).rejects.toThrow("502 Bad Gateway");
+    vi.stubGlobal("fetch", async () => new Response("", { status: 503 }));
+    await expect(api.overview()).rejects.toThrow("503 request failed");
   });
 
   it("signals an expired session", async () => {

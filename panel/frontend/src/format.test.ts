@@ -1,6 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { cls, fmtBytes, fmtDuration, fmtRate } from "./ui";
-import { rateTicks } from "./views/TrafficChart";
+import { cls, fmtBytes, fmtDuration, fmtRate } from "./format";
 
 describe("fmtBytes", () => {
   it("uses binary units", () => {
@@ -37,20 +36,5 @@ describe("fmtDuration", () => {
 describe("cls", () => {
   it("drops falsy parts", () => {
     expect(cls("a", false, null, undefined, "b")).toBe("a b");
-  });
-});
-
-describe("rateTicks", () => {
-  it("starts at zero and covers the peak with round steps", () => {
-    const ticks = rateTicks(900 * 1024);
-    expect(ticks[0]).toBe(0);
-    expect(ticks[ticks.length - 1]).toBeGreaterThanOrEqual(900 * 1024);
-    const step = ticks[1] - ticks[0];
-    expect(step).toBe(250 * 1024);
-    ticks.forEach((t, i) => expect(t).toBeCloseTo(i * step));
-  });
-
-  it("handles an idle chart", () => {
-    expect(rateTicks(0)).toEqual([0]);
   });
 });

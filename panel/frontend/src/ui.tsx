@@ -1,54 +1,7 @@
 import { createContext, useCallback, useContext, useEffect, useId, useRef, useState, type ReactNode } from "react";
 import { createPortal } from "react-dom";
 import { AlertTriangle, Check, CheckCircle2, ChevronDown, Copy, Info, Loader2, X } from "lucide-react";
-
-export function cls(...xs: (string | false | null | undefined)[]): string {
-  return xs.filter(Boolean).join(" ");
-}
-
-const BYTE_UNITS = ["B", "KiB", "MiB", "GiB", "TiB", "PiB"];
-
-export function fmtBytes(n: number): string {
-  if (!Number.isFinite(n) || n <= 0) return "0 B";
-  const i = Math.min(Math.floor(Math.log(n) / Math.log(1024)), BYTE_UNITS.length - 1);
-  const v = n / 1024 ** i;
-  return `${v.toFixed(i === 0 ? 0 : v < 10 ? 2 : 1)} ${BYTE_UNITS[i]}`;
-}
-
-export function fmtRate(bytesPerSec: number): string {
-  return `${fmtBytes(bytesPerSec)}/s`;
-}
-
-export function fmtDuration(secs: number): string {
-  if (!Number.isFinite(secs) || secs < 0) return "—";
-  const s = Math.floor(secs);
-  const d = Math.floor(s / 86400);
-  const h = Math.floor((s % 86400) / 3600);
-  const m = Math.floor((s % 3600) / 60);
-  if (d) return `${d}d ${h}h`;
-  if (h) return `${h}h ${m}m`;
-  if (m) return `${m}m ${s % 60}s`;
-  return `${s}s`;
-}
-
-export function nowSecs(): number {
-  return Math.floor(Date.now() / 1000);
-}
-
-export function fmtAgo(unixSecs: number): string {
-  if (!unixSecs) return "never";
-  const d = nowSecs() - unixSecs;
-  if (d < 5) return "just now";
-  return `${fmtDuration(d)} ago`;
-}
-
-export function fmtDateTime(unixSecs: number): string {
-  return unixSecs ? new Date(unixSecs * 1000).toLocaleString() : "—";
-}
-
-export function fmtClock(unixMs: number): string {
-  return new Date(unixMs).toLocaleTimeString([], { hour12: false });
-}
+import { cls } from "./format";
 
 // Copies to the clipboard. navigator.clipboard only exists on secure origins,
 // and the panel is often opened over plain HTTP, so fall back to execCommand.
@@ -101,10 +54,12 @@ export function ToastProvider({ children }: { children: ReactNode }) {
     <ToastCtx.Provider value={push}>
       {children}
       {createPortal(
-        <div className="fixed bottom-5 right-5 z-[60] flex w-80 flex-col gap-2" role="status" aria-live="polite">
+        <div className="fixed bottom-5 right-5 z-[60] flex w-80 flex-col gap-2">
           {toasts.map((t) => (
             <div
               key={t.id}
+              // Errors interrupt the screen reader; the rest wait their turn.
+              role={t.kind === "error" ? "alert" : "status"}
               className={cls(
                 "card flex animate-fade-in items-start gap-3 px-4 py-3 text-sm shadow-glow",
                 t.kind === "error" && "border-rose-500/50",
@@ -131,8 +86,11 @@ export function ToastProvider({ children }: { children: ReactNode }) {
   );
 }
 
-// Open modals, innermost last: Escape only closes the one on top.
+// Open modals, innermost last: only the one on top handles the keyboard.
 const modalStack: string[] = [];
+
+const FOCUSABLE =
+  "a[href], button:not(:disabled), input:not(:disabled), select:not(:disabled), textarea:not(:disabled), [tabindex]:not([tabindex='-1'])";
 
 export function Modal({
   onClose,
@@ -140,16 +98,22 @@ export function Modal({
   children,
   footer,
   size = "md",
+  dismissible = true,
 }: {
   onClose: () => void;
   title: ReactNode;
   children: ReactNode;
   footer?: ReactNode;
   size?: "sm" | "md" | "lg" | "xl";
+  // When false, Escape and clicks on the backdrop leave the dialog open, so a
+  // secret shown only once can't be lost by accident; the buttons still close it.
+  dismissible?: boolean;
 }) {
   const id = useId();
   const closeRef = useRef(onClose);
   closeRef.current = onClose;
+  const dismissibleRef = useRef(dismissible);
+  dismissibleRef.current = dismissible;
   const panelRef = useRef<HTMLDivElement>(null);
 
   useEffect(() => {
@@ -158,9 +122,25 @@ export function Modal({
     const first = panelRef.current?.querySelector<HTMLElement>("[autofocus], input, select, textarea");
     (first ?? panelRef.current)?.focus();
     const onKey = (e: KeyboardEvent) => {
-      if (e.key === "Escape" && modalStack[modalStack.length - 1] === id) {
+      const panel = panelRef.current;
+      if (modalStack[modalStack.length - 1] !== id || !panel) return;
+      if (e.key === "Escape" && dismissibleRef.current) {
         e.preventDefault();
         closeRef.current();
+      } else if (e.key === "Tab") {
+        // Keep Tab inside the dialog instead of wandering into the page behind it.
+        const items = Array.from(panel.querySelectorAll<HTMLElement>(FOCUSABLE));
+        if (items.length === 0) return;
+        const firstItem = items[0];
+        const lastItem = items[items.length - 1];
+        const inside = panel.contains(document.activeElement);
+        if (e.shiftKey && (!inside || document.activeElement === firstItem || document.activeElement === panel)) {
+          e.preventDefault();
+          lastItem.focus();
+        } else if (!e.shiftKey && (!inside || document.activeElement === lastItem)) {
+          e.preventDefault();
+          firstItem.focus();
+        }
       }
     };
     window.addEventListener("keydown", onKey);
@@ -176,7 +156,7 @@ export function Modal({
   return createPortal(
     <div
       className="fixed inset-0 z-50 flex items-start justify-center overflow-y-auto bg-black/60 p-4 backdrop-blur-sm sm:p-8"
-      onMouseDown={(e) => e.target === e.currentTarget && onClose()}
+      onMouseDown={(e) => dismissible && e.target === e.currentTarget && onClose()}
     >
       <div
         ref={panelRef}
@@ -230,15 +210,21 @@ export function ConfirmDialog({
 }) {
   const [typed, setTyped] = useState("");
   const [busy, setBusy] = useState(false);
+  // The busy state only disables the button once React re-renders; this ref
+  // also stops a second Enter press that arrives before that.
+  const inFlight = useRef(false);
   const blocked = typeToConfirm !== undefined && typed !== typeToConfirm;
 
   const confirm = async () => {
+    if (inFlight.current) return;
+    inFlight.current = true;
     setBusy(true);
     try {
       await onConfirm();
       onClose();
     } catch {
       // onConfirm reports its own errors; keep the dialog open for a retry.
+      inFlight.current = false;
       setBusy(false);
     }
   };
@@ -272,7 +258,7 @@ export function ConfirmDialog({
                 autoComplete="off"
                 spellCheck={false}
                 onChange={(e) => setTyped(e.target.value)}
-                onKeyDown={(e) => e.key === "Enter" && !blocked && confirm()}
+                onKeyDown={(e) => e.key === "Enter" && !blocked && !busy && confirm()}
               />
             )}
           </Field>
@@ -634,6 +620,30 @@ export interface MenuItem {
   hint?: string;
 }
 
+// Where arrow keys, Home and End move focus in a menu or tab list of `count`
+// items, wrapping around at the ends; null for any other key.
+export function arrowTarget(
+  key: string,
+  current: number,
+  count: number,
+  orientation: "vertical" | "horizontal",
+): number | null {
+  if (count === 0) return null;
+  const [prev, next] = orientation === "vertical" ? ["ArrowUp", "ArrowDown"] : ["ArrowLeft", "ArrowRight"];
+  switch (key) {
+    case next:
+      return (current + 1) % count;
+    case prev:
+      return current <= 0 ? count - 1 : current - 1;
+    case "Home":
+      return 0;
+    case "End":
+      return count - 1;
+    default:
+      return null;
+  }
+}
+
 // A dropdown of row actions. The list is portalled with fixed positioning so
 // scrolling table containers don't clip it.
 export function Menu({ label, icon, items }: { label: string; icon: ReactNode; items: MenuItem[] }) {
@@ -652,6 +662,13 @@ export function Menu({ label, icon, items }: { label: string; icon: ReactNode; i
       if (e.key === "Escape") {
         close();
         buttonRef.current?.focus();
+        return;
+      }
+      const items = Array.from(listRef.current?.querySelectorAll<HTMLElement>("button:not(:disabled)") ?? []);
+      const next = arrowTarget(e.key, items.indexOf(document.activeElement as HTMLElement), items.length, "vertical");
+      if (next !== null) {
+        e.preventDefault();
+        items[next].focus();
       }
     };
     listRef.current?.querySelector<HTMLElement>("button:not(:disabled)")?.focus();
