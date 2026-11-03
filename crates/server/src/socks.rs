@@ -130,13 +130,14 @@ where
             }
         };
 
+        // Count before replying, so the client never sees a connection the stats don't.
+        user.stats.total.fetch_add(1, Ordering::Relaxed);
+        node.stats.total.fetch_add(1, Ordering::Relaxed);
+
         let mut reply = vec![SOCKS_VERSION, rep::SUCCEEDED, 0];
         bound.encode(&mut reply);
         client.write_all(&reply).await?;
         client.flush().await?;
-
-        user.stats.total.fetch_add(1, Ordering::Relaxed);
-        node.stats.total.fetch_add(1, Ordering::Relaxed);
         debug!(id = conn.entry.id, user = %user.username, node = %node.id, %target, "stream open");
 
         let mut metered =
