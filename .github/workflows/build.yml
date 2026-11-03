@@ -91,7 +91,7 @@ jobs:
           mkdir -p "dist/$name"
           bin="target/${{ matrix.target }}/release"
           if [ "$RUNNER_OS" = "Windows" ]; then ext=".exe"; else ext=""; fi
-          cp "$bin/wirefox-server$ext" "$bin/wirefox-node$ext" examples/node.toml LICENSE "dist/$name/"
+          cp "$bin/wirefox-server$ext" "$bin/wirefox-node$ext" examples/node.toml examples/wirefox-node-managed.service LICENSE "dist/$name/"
           cd dist
           if [ "$RUNNER_OS" = "Windows" ]; then
             7z a -tzip "$name.zip" "$name" > /dev/null
@@ -107,10 +107,53 @@ jobs:
           path: dist/*
           if-no-files-found: error
 
+  panel:
+    name: panel-linux-${{ matrix.goarch }}
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        goarch: [amd64, arm64]
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-node@v5
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: panel/frontend/package-lock.json
+      - uses: actions/setup-go@v6
+        with:
+          go-version-file: panel/go.mod
+          cache-dependency-path: panel/go.sum
+
+      - name: Build
+        working-directory: panel
+        env:
+          CGO_ENABLED: "0"
+          GOOS: linux
+          GOARCH: ${{ matrix.goarch }}
+        run: |
+          (cd frontend && npm ci && npm run build)
+          go build -trimpath -ldflags "-s -w -X main.version=${GITHUB_REF_NAME}" -o out/wirefox-panel ./cmd/wirefox-panel
+
+      - name: Package
+        run: |
+          name="wirefox-${GITHUB_REF_NAME//\//-}-panel-linux-${{ matrix.goarch }}"
+          mkdir -p "dist/$name"
+          cp panel/out/wirefox-panel panel/README.md panel/API.md LICENSE "dist/$name/"
+          tar -czf "dist/$name.tar.gz" -C dist "$name"
+          rm -rf "dist/$name"
+
+      - uses: actions/upload-artifact@v7
+        with:
+          name: wirefox-panel-linux-${{ matrix.goarch }}
+          path: dist/*
+          if-no-files-found: error
+
   release:
     name: Release
     if: startsWith(github.ref, 'refs/tags/v')
-    needs: [ci, build]
+    needs: [ci, build, panel]
     runs-on: ubuntu-latest
     permissions:
       contents: write

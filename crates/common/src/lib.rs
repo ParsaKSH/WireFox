@@ -12,9 +12,27 @@ pub const VERSION: &str = env!("CARGO_PKG_VERSION");
 
 /// Set up logging. `RUST_LOG` overrides `default_level`.
 pub fn init_tracing(default_level: &str) {
-    use tracing_subscriber::EnvFilter;
+    init_tracing_with(default_level, tracing_subscriber::layer::Identity::new());
+}
+
+/// Like [`init_tracing`], and every event that passes the filter also goes to `layer`.
+pub fn init_tracing_with<L>(default_level: &str, layer: L)
+where
+    L: tracing_subscriber::Layer<tracing_subscriber::Registry> + Send + Sync + 'static,
+{
+    use std::io::IsTerminal;
+    use tracing_subscriber::layer::SubscriberExt;
+    use tracing_subscriber::util::SubscriberInitExt;
+    use tracing_subscriber::{fmt, EnvFilter};
     let filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new(default_level));
-    tracing_subscriber::fmt().with_env_filter(filter).with_target(false).init();
+    // Colours only on a terminal; under systemd they'd end up as junk in the journal.
+    let ansi = std::io::stdout().is_terminal();
+    // The filter is global, so it applies to `layer` too although it sits below it.
+    tracing_subscriber::registry()
+        .with(layer)
+        .with(filter)
+        .with(fmt::layer().with_target(false).with_ansi(ansi))
+        .init();
 }
 
 /// Random hex token made of `bytes` bytes from the OS CSPRNG.

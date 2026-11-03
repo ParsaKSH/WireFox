@@ -60,11 +60,16 @@ impl NodeConfig {
 
     pub fn parse(text: &str) -> Result<Self> {
         let cfg: NodeConfig = toml::from_str(text)?;
-        ensure!((1..=4096).contains(&cfg.pool_size), "pool_size must be between 1 and 4096");
-        ensure!(cfg.max_extra <= 65536, "max_extra must be at most 65536");
-        ensure!(cfg.connect_timeout_secs >= 1, "connect_timeout_secs must be at least 1");
-        wirefox_common::tls::parse_fingerprint(&cfg.server_fingerprint).context("server_fingerprint")?;
+        cfg.validate()?;
         Ok(cfg)
+    }
+
+    pub fn validate(&self) -> Result<()> {
+        ensure!((1..=4096).contains(&self.pool_size), "pool_size must be between 1 and 4096");
+        ensure!(self.max_extra <= 65536, "max_extra must be at most 65536");
+        ensure!(self.connect_timeout_secs >= 1, "connect_timeout_secs must be at least 1");
+        wirefox_common::tls::parse_fingerprint(&self.server_fingerprint).context("server_fingerprint")?;
+        Ok(())
     }
 }
 

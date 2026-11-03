@@ -88,7 +88,10 @@ pub struct CreateUser {
 
 pub async fn create(State(st): State<Arc<ApiState>>, Json(body): Json<CreateUser>) -> ApiResult<serde_json::Value> {
     if !valid_id(&body.username) {
-        return Err(error(StatusCode::BAD_REQUEST, "username must be 1-64 characters of [A-Za-z0-9._-]"));
+        return Err(error(
+            StatusCode::BAD_REQUEST,
+            "username must be 1-64 characters of [A-Za-z0-9._-], and not only dots",
+        ));
     }
     check_nodes_exist(&st, &body.nodes)?;
     let generated = body.password.is_none();

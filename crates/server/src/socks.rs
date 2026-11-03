@@ -7,7 +7,6 @@ use std::pin::Pin;
 use std::sync::atomic::Ordering;
 use std::sync::Arc;
 use std::task::{Context, Poll};
-use std::time::Duration;
 
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, ReadBuf};
 use tokio::net::TcpListener;
@@ -17,8 +16,9 @@ use tracing::{debug, warn};
 use wirefox_common::net::{accept, relay, tune_tcp};
 use wirefox_common::proto::{self, read_short_string, rep, Target};
 
-use crate::balance::{Candidate, Strategy};
+use crate::balance::Candidate;
 use crate::limiter::SocksAuthLimiter;
+use crate::settings::LiveSettings;
 use crate::state::{ConnEntry, Store, Traffic, UserEntry};
 use crate::tunnel::{NodeSession, TunnelConn};
 
@@ -36,10 +36,8 @@ const STALE_RETRIES: usize = 3;
 pub struct SocksCtx {
     pub store: Arc<Store>,
     pub limiter: Arc<SocksAuthLimiter>,
-    /// Default node selection; users may override it.
-    pub balance: Strategy,
-    pub handshake_timeout: Duration,
-    pub connect_timeout: Duration,
+    /// Read once per connection, so API changes apply to new connections.
+    pub settings: Arc<LiveSettings>,
 }
 
 pub async fn serve(listener: TcpListener, tls: Option<TlsAcceptor>, ctx: SocksCtx) {
@@ -51,11 +49,14 @@ pub async fn serve(listener: TcpListener, tls: Option<TlsAcceptor>, ctx: SocksCt
             let _ = tune_tcp(&stream);
             let result = match tls {
                 None => handle(stream, peer, ctx).await,
-                Some(acceptor) => match tokio::time::timeout(ctx.handshake_timeout, acceptor.accept(stream)).await {
-                    Ok(Ok(stream)) => handle(stream, peer, ctx).await,
-                    Ok(Err(e)) => Err(e),
-                    Err(_) => Err(io::Error::new(io::ErrorKind::TimedOut, "TLS handshake timed out")),
-                },
+                Some(acceptor) => {
+                    let timeout = ctx.settings.get().handshake_timeout();
+                    match tokio::time::timeout(timeout, acceptor.accept(stream)).await {
+                        Ok(Ok(stream)) => handle(stream, peer, ctx).await,
+                        Ok(Err(e)) => Err(e),
+                        Err(_) => Err(io::Error::new(io::ErrorKind::TimedOut, "TLS handshake timed out")),
+                    }
+                }
             };
             if let Err(e) = result {
                 debug!(%peer, error = %e, "socks connection closed");
@@ -78,7 +79,8 @@ async fn handle<S>(mut client: S, peer: SocketAddr, ctx: SocksCtx) -> io::Result
 where
     S: AsyncRead + AsyncWrite + Unpin,
 {
-    let (user, target) = tokio::time::timeout(ctx.handshake_timeout, handshake(&mut client, peer, &ctx))
+    let settings = ctx.settings.get();
+    let (user, target) = tokio::time::timeout(settings.handshake_timeout(), handshake(&mut client, peer, &ctx))
         .await
         .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "handshake timed out"))??;
 
@@ -88,10 +90,10 @@ where
         return Err(io::Error::other(format!("user {} reached max_connections", user.username)));
     };
 
-    let deadline = Instant::now() + ctx.connect_timeout;
+    let deadline = Instant::now() + settings.connect_timeout();
     let mut tried = Vec::new();
     loop {
-        let Some(Candidate { node, session }) = ctx.store.pick_node(&user, ctx.balance, &tried) else {
+        let Some(Candidate { node, session }) = ctx.store.pick_node(&user, settings.balance, &tried) else {
             reply_error(&mut client, rep::NETWORK_UNREACHABLE).await;
             return Err(io::Error::other(format!("no node online for user {}", user.username)));
         };
@@ -288,7 +290,11 @@ impl<S: AsyncWrite + Unpin> AsyncWrite for Metered<S> {
 
 #[cfg(test)]
 mod tests {
+    use std::time::Duration;
+
     use super::*;
+    use crate::balance::Strategy;
+    use crate::settings::Settings;
     use crate::state::{SocksPassword, UserCfg};
 
     fn ctx() -> SocksCtx {
@@ -306,9 +312,11 @@ mod tests {
         SocksCtx {
             store,
             limiter: Arc::new(SocksAuthLimiter::new(Duration::from_secs(60))),
-            balance: Strategy::default(),
-            handshake_timeout: Duration::from_secs(5),
-            connect_timeout: Duration::from_secs(5),
+            settings: Arc::new(LiveSettings::new(Settings {
+                balance: Strategy::default(),
+                handshake_timeout_secs: 5,
+                connect_timeout_secs: 5,
+            })),
         }
     }
 

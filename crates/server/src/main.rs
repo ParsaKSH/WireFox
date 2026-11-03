@@ -133,6 +133,7 @@ balance = "least-load"
 [api]
 listen = "127.0.0.1:9090"
 tls = false
+# Leave out both admin_* lines to allow only API keys.
 admin_username = "admin"
 admin_password_hash = "{password_hash}"
 api_key_hashes = ["{api_key_hash}"]

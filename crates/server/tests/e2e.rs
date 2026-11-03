@@ -28,9 +28,14 @@ impl Drop for Fixture {
 }
 
 async fn start_server() -> Fixture {
+    let admin_hash = argon2::Argon2::default().hash_password(ADMIN_PASSWORD.as_bytes()).unwrap().to_string();
+    start_server_with(&format!("admin_username = \"admin\"\nadmin_password_hash = \"{admin_hash}\"")).await
+}
+
+/// `api_extra` goes into the `[api]` section.
+async fn start_server_with(api_extra: &str) -> Fixture {
     let dir = std::env::temp_dir().join(format!("wirefox-e2e-{}", wirefox_common::random_token(8)));
     std::fs::create_dir_all(&dir).unwrap();
-    let admin_hash = argon2::Argon2::default().hash_password(ADMIN_PASSWORD.as_bytes()).unwrap().to_string();
     let config = format!(
         r#"
         data_dir = "data"
@@ -42,9 +47,8 @@ async fn start_server() -> Fixture {
         connect_timeout_secs = 5
         [api]
         listen = "127.0.0.1:0"
-        admin_username = "admin"
-        admin_password_hash = "{admin_hash}"
         api_key_hashes = ["{}"]
+        {api_extra}
         "#,
         wirefox_common::sha256_hex(API_KEY.as_bytes())
     );
@@ -361,4 +365,91 @@ async fn load_balancing_across_nodes() {
     assert!(user["balance"].is_null());
     let (_, status) = api(api_addr, "GET", "/status", Some(API_KEY), None).await;
     assert_eq!(status["default_balance"], "least-load");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn live_settings_without_admin_login() {
+    let fixture = start_server_with("").await;
+    let api_addr = fixture.server.api_addr;
+    let socks = fixture.server.socks_addrs[0];
+    let target = echo_server().await;
+
+    // No admin credentials configured: login is off, the API key still works.
+    let (status, body) =
+        api(api_addr, "POST", "/auth/login", None, Some(json!({"username": "admin", "password": "x"}))).await;
+    assert_eq!(status, 404);
+    assert_eq!(body["error"], "admin login is disabled");
+    assert_eq!(api(api_addr, "GET", "/settings", None, None).await.0, 401);
+    let (status, settings) = api(api_addr, "GET", "/settings", Some(API_KEY), None).await;
+    assert_eq!(status, 200);
+    assert_eq!(settings, json!({"balance": "least-load", "handshake_timeout_secs": 10, "connect_timeout_secs": 5}));
+
+    let ids = ["n1", "n2"];
+    for id in ids {
+        let (_, created) = api(api_addr, "POST", "/nodes", Some(API_KEY), Some(json!({"id": id}))).await;
+        start_node(&fixture, created["node_config"].as_str().unwrap(), 2).await;
+    }
+    for (name, nodes) in [("pinned", json!(["n1"])), ("bob", json!([]))] {
+        let body = json!({"username": name, "password": "pw", "nodes": nodes});
+        assert_eq!(api(api_addr, "POST", "/users", Some(API_KEY), Some(body)).await.0, 200);
+    }
+
+    // Load n1 with three held connections; under least-load bob avoids it.
+    let mut held = Vec::new();
+    for _ in 0..3 {
+        let (stream, code) = socks_connect(socks, "pinned", "pw", target).await;
+        assert_eq!(code, 0);
+        held.push(stream);
+    }
+    let before = totals(&fixture, &ids);
+    for _ in 0..3 {
+        let (stream, code) = socks_connect(socks, "bob", "pw", target).await;
+        assert_eq!(code, 0);
+        held.push(stream);
+    }
+    assert_eq!(delta(&totals(&fixture, &ids), &before), [0, 3]);
+
+    // Switching the server default to round-robin applies to bob's next
+    // connections right away, whatever the load.
+    let (status, settings) =
+        api(api_addr, "PATCH", "/settings", Some(API_KEY), Some(json!({"balance": "round-robin"}))).await;
+    assert_eq!(status, 200, "{settings}");
+    assert_eq!(settings, json!({"balance": "round-robin", "handshake_timeout_secs": 10, "connect_timeout_secs": 5}));
+    let before = totals(&fixture, &ids);
+    for _ in 0..4 {
+        let (stream, code) = socks_connect(socks, "bob", "pw", target).await;
+        assert_eq!(code, 0);
+        held.push(stream);
+    }
+    assert_eq!(delta(&totals(&fixture, &ids), &before), [2, 2]);
+    drop(held);
+    let (_, status) = api(api_addr, "GET", "/status", Some(API_KEY), None).await;
+    assert_eq!(status["default_balance"], "round-robin");
+
+    // Invalid values are rejected and change nothing, not even the valid part.
+    for body in [
+        json!({"connect_timeout_secs": 0}),
+        json!({"handshake_timeout_secs": 601}),
+        json!({"balance": "least-load", "connect_timeout_secs": -1}),
+        json!({"balance": "random", "handshake_timeout_secs": 0}),
+        json!({"balance": "fastest"}),
+        json!({"timeout": 5}),
+    ] {
+        let (status, error) = api(api_addr, "PATCH", "/settings", Some(API_KEY), Some(body.clone())).await;
+        assert_eq!(status, 400, "{body}");
+        assert!(error["error"].is_string(), "{error}");
+    }
+    let (_, settings) = api(api_addr, "GET", "/settings", Some(API_KEY), None).await;
+    assert_eq!(settings, json!({"balance": "round-robin", "handshake_timeout_secs": 10, "connect_timeout_secs": 5}));
+
+    // A shorter handshake timeout applies to the next client that stalls.
+    let body = json!({"handshake_timeout_secs": 1, "connect_timeout_secs": 7});
+    let (status, settings) = api(api_addr, "PATCH", "/settings", Some(API_KEY), Some(body)).await;
+    assert_eq!(status, 200);
+    assert_eq!(settings, json!({"balance": "round-robin", "handshake_timeout_secs": 1, "connect_timeout_secs": 7}));
+    assert_eq!(api(api_addr, "GET", "/settings", Some(API_KEY), None).await.1, settings);
+    let mut stalled = TcpStream::connect(socks).await.unwrap();
+    let mut buf = [0u8; 1];
+    let n = tokio::time::timeout(Duration::from_secs(5), stalled.read(&mut buf)).await.unwrap().unwrap_or(0);
+    assert_eq!(n, 0, "a stalled handshake should be closed");
 }

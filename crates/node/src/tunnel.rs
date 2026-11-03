@@ -4,6 +4,7 @@
 use std::fmt;
 use std::io;
 use std::net::SocketAddr;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -11,7 +12,7 @@ use anyhow::{anyhow, Context, Result};
 use parking_lot::RwLock;
 use tokio::io::{AsyncReadExt, AsyncWriteExt, ReadHalf, WriteHalf};
 use tokio::net::TcpStream;
-use tokio::sync::{mpsc, Semaphore};
+use tokio::sync::{mpsc, watch, Semaphore};
 use tokio_rustls::client::TlsStream;
 use tokio_rustls::rustls::pki_types::ServerName;
 use tokio_rustls::TlsConnector;
@@ -44,6 +45,95 @@ impl fmt::Display for Rejected {
 
 impl std::error::Error for Rejected {}
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum TunnelState {
+    Stopped,
+    Connecting,
+    Connected,
+    /// The last attempt failed and the node keeps retrying.
+    Error,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct TunnelStatus {
+    pub state: TunnelState,
+    /// Why the tunnel is down, while it is in [`TunnelState::Error`].
+    pub last_error: Option<String>,
+    pub connected_since: Option<Instant>,
+}
+
+/// Observable state of a tunnel. A monitor can be shared by consecutive nodes
+/// (managed mode replaces the node on every config change), so its stream
+/// counters cover the whole process.
+pub struct Monitor {
+    status: watch::Sender<TunnelStatus>,
+    active_streams: Arc<AtomicU64>,
+    total_streams: AtomicU64,
+}
+
+impl Default for Monitor {
+    fn default() -> Self {
+        let status = TunnelStatus { state: TunnelState::Stopped, last_error: None, connected_since: None };
+        Monitor {
+            status: watch::Sender::new(status),
+            active_streams: Arc::new(AtomicU64::new(0)),
+            total_streams: AtomicU64::new(0),
+        }
+    }
+}
+
+impl Monitor {
+    pub fn status(&self) -> TunnelStatus {
+        self.status.borrow().clone()
+    }
+
+    /// Notifies on every change of the tunnel status.
+    pub fn subscribe(&self) -> watch::Receiver<TunnelStatus> {
+        self.status.subscribe()
+    }
+
+    /// Streams being relayed right now.
+    pub fn active_streams(&self) -> u64 {
+        self.active_streams.load(Ordering::Relaxed)
+    }
+
+    /// Streams relayed since the monitor was created.
+    pub fn total_streams(&self) -> u64 {
+        self.total_streams.load(Ordering::Relaxed)
+    }
+
+    /// For the owner of a node that has been shut down.
+    pub fn set_stopped(&self) {
+        self.set(TunnelState::Stopped, None);
+    }
+
+    fn set(&self, state: TunnelState, last_error: Option<String>) {
+        self.status.send_if_modified(|current| {
+            if current.state == state && current.last_error == last_error {
+                return false;
+            }
+            let connected_since = (state == TunnelState::Connected).then(Instant::now);
+            *current = TunnelStatus { state, last_error, connected_since };
+            true
+        });
+    }
+
+    fn stream_started(&self) -> ActiveStream {
+        self.total_streams.fetch_add(1, Ordering::Relaxed);
+        self.active_streams.fetch_add(1, Ordering::Relaxed);
+        ActiveStream(self.active_streams.clone())
+    }
+}
+
+/// Counts as an active stream until dropped.
+struct ActiveStream(Arc<AtomicU64>);
+
+impl Drop for ActiveStream {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, Ordering::Relaxed);
+    }
+}
+
 pub struct Node {
     cfg: NodeConfig,
     connector: TlsConnector,
@@ -57,10 +147,16 @@ pub struct Node {
     /// Dialer for connections to the server.
     uplink: Dialer,
     extra: Arc<Semaphore>,
+    monitor: Arc<Monitor>,
 }
 
 impl Node {
     pub fn new(cfg: NodeConfig) -> Result<Arc<Self>> {
+        Self::with_monitor(cfg, Arc::default())
+    }
+
+    /// A node that reports its state to `monitor`.
+    pub fn with_monitor(cfg: NodeConfig, monitor: Arc<Monitor>) -> Result<Arc<Self>> {
         let tls = wirefox_common::tls::pinned_client_config(&cfg.server_fingerprint)?;
         let server_name = ServerName::try_from(cfg.server_name.clone()).context("invalid server_name")?;
         let server = parse_host_port(&cfg.server)?;
@@ -74,17 +170,36 @@ impl Node {
             server_name,
             server,
             cfg,
+            monitor,
         }))
+    }
+
+    pub fn monitor(&self) -> &Arc<Monitor> {
+        &self.monitor
+    }
+
+    /// Why proxied traffic can't leave right now, if it can't: the egress
+    /// interface is missing, or the source address isn't on it. The tunnel
+    /// itself may well be up meanwhile.
+    pub fn egress_error(&self) -> Option<String> {
+        self.egress.error().map(|e| format!("egress: {e}"))
     }
 
     /// Stay connected to the server forever, reconnecting with backoff.
     pub async fn run(self: Arc<Self>) {
+        self.monitor.set(TunnelState::Connecting, None);
         let mut backoff = Duration::from_secs(1);
         loop {
             let started = Instant::now();
             match self.clone().session().await {
-                Ok(()) => info!("control session closed by the server"),
-                Err(e) => warn!("control session ended: {e:#}"),
+                Ok(()) => {
+                    info!("control session closed by the server");
+                    self.monitor.set(TunnelState::Connecting, None);
+                }
+                Err(e) => {
+                    warn!("control session ended: {e:#}");
+                    self.monitor.set(TunnelState::Error, Some(format!("{e:#}")));
+                }
             }
             if started.elapsed() > Duration::from_secs(60) {
                 backoff = Duration::from_secs(1);
@@ -130,6 +245,7 @@ impl Node {
         let peer = ctrl.get_ref().0.peer_addr()?;
         *self.server_addrs.write() = std::iter::once(peer).chain(addrs.into_iter().filter(|a| *a != peer)).collect();
         info!(server = %self.cfg.server, %peer, "connected to server");
+        self.monitor.set(TunnelState::Connected, None);
 
         let info = NodeInfo {
             hostname: hostname(),
@@ -181,15 +297,15 @@ impl Node {
             let reply = match msg {
                 ServerMsg::Ping { seq } => Some(NodeMsg::Pong { seq }),
                 ServerMsg::Demand { count } => {
-                    self.spawn_extra(count.min(MAX_DEMAND_PER_MSG));
+                    self.spawn_extra(count.min(MAX_DEMAND_PER_MSG), cancel);
                     None
                 }
                 ServerMsg::SetEgress { egress } => {
                     let error = self.egress.set_override(egress);
                     let egress = self.egress.effective();
                     match &error {
-                        None => info!(?egress, "egress set by server"),
-                        Some(e) => warn!(?egress, error = %e, "egress set by server is not usable yet"),
+                        None => info!(%egress, "egress set by server"),
+                        Some(e) => warn!(%egress, error = %e, "egress set by server is not usable yet"),
                     }
                     Some(NodeMsg::EgressApplied { egress, error })
                 }
@@ -239,22 +355,33 @@ impl Node {
         }
     }
 
-    fn spawn_extra(self: &Arc<Self>, count: u32) {
+    /// Open up to `count` more data connections for a burst. Like the pool
+    /// slots they end with the session (and so with the node), unless they
+    /// already carry a stream: a node that was replaced must not pick up
+    /// streams for its successor.
+    fn spawn_extra(self: &Arc<Self>, count: u32, cancel: &CancellationToken) {
         for _ in 0..count {
             let Ok(permit) = self.extra.clone().try_acquire_owned() else {
                 debug!("max_extra reached, ignoring the rest of the demand");
                 return;
             };
-            let node = self.clone();
+            let (node, cancel) = (self.clone(), cancel.clone());
             tokio::spawn(async move {
-                let mut conn = match node.open_data().await {
+                let conn = tokio::select! {
+                    _ = cancel.cancelled() => return,
+                    r = node.open_data() => r,
+                };
+                let mut conn = match conn {
                     Ok(c) => c,
                     Err(e) => return debug!("extra data connection failed: {e:#}"),
                 };
-                let request = tokio::time::timeout(EXTRA_IDLE_TIMEOUT, proto::read_connect(&mut conn)).await;
+                let request = tokio::select! {
+                    _ = cancel.cancelled() => None,
+                    r = tokio::time::timeout(EXTRA_IDLE_TIMEOUT, proto::read_connect(&mut conn)) => r.ok(),
+                };
                 drop(permit);
                 match request {
-                    Ok(Ok(target)) => node.serve(conn, target).await,
+                    Some(Ok(target)) => node.serve(conn, target).await,
                     // Close properly so the server drops it from its pool right away.
                     _ => {
                         let _ = conn.shutdown().await;
@@ -275,6 +402,7 @@ impl Node {
             }
         };
         let bound = out.local_addr().map(Target::from_socket_addr).unwrap_or_else(|_| Target::unspecified());
+        let _active = self.monitor.stream_started();
         if proto::write_reply(&mut conn, rep::SUCCEEDED, &bound).await.is_err() {
             return;
         }
@@ -292,7 +420,7 @@ async fn write_control(mut wr: WriteHalf<Conn>, mut rx: mpsc::Receiver<NodeMsg>)
     Ok(())
 }
 
-fn parse_host_port(s: &str) -> Result<Target> {
+pub(crate) fn parse_host_port(s: &str) -> Result<Target> {
     if let Ok(addr) = s.parse::<SocketAddr>() {
         return Ok(Target::from_socket_addr(addr));
     }
@@ -302,7 +430,7 @@ fn parse_host_port(s: &str) -> Result<Target> {
     Ok(Target { host: Host::Domain(host.to_string()), port })
 }
 
-fn hostname() -> String {
+pub(crate) fn hostname() -> String {
     #[cfg(windows)]
     let name = std::env::var("COMPUTERNAME").ok();
     #[cfg(not(windows))]
