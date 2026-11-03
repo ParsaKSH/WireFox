@@ -1,0 +1,42 @@
+# Exit-node managed by wirefox-panel. The panel sends the tunnel config; the
+# node keeps the last one in /var/lib/wirefox-node, so it stays up while the
+# panel is unreachable.
+#
+# Setup:
+#   useradd --system --no-create-home --shell /usr/sbin/nologin wirefox
+#   install -d -m 750 -o root -g wirefox /etc/wirefox
+#   install -m 640 -o root -g wirefox /dev/null /etc/wirefox/node.env
+#   echo 'WIREFOX_NODE_KEY=<key the panel shows for this node>' > /etc/wirefox/node.env
+#   cp wirefox-node-managed.service /etc/systemd/system/ && systemctl enable --now wirefox-node-managed
+#
+# After the panel issues a new key, update node.env and restart the service.
+
+[Unit]
+Description=WireFox exit-node (managed by wirefox-panel)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+EnvironmentFile=/etc/wirefox/node.env
+ExecStart=/usr/local/bin/wirefox-node run
+StateDirectory=wirefox-node
+StateDirectoryMode=0700
+User=wirefox
+Group=wirefox
+Restart=always
+RestartSec=2
+LimitNOFILE=1048576
+
+# Binding to an interface by name works unprivileged on Linux 5.7 and newer.
+# On older kernels it needs CAP_NET_RAW: replace the empty
+# CapabilityBoundingSet= below with the two commented lines.
+CapabilityBoundingSet=
+#CapabilityBoundingSet=CAP_NET_RAW
+#AmbientCapabilities=CAP_NET_RAW
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+
+[Install]
+WantedBy=multi-user.target
