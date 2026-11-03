@@ -1,9 +1,11 @@
 import { useState, type FormEvent } from "react";
 import { Dices, Link2, Pencil, Plus, RotateCcw, Trash2, UserRound, X } from "lucide-react";
 import { api, errorMessage } from "../api";
-import { useResource } from "../hooks";
+import { fmtBytes } from "../format";
+import { POLL_SLOW_MS, useResource } from "../hooks";
 import { generatePassword, portOf, socksUrl } from "../socks";
 import { BALANCES, type Balance, type Node, type User, type UserCreate } from "../types";
+import { idError, intError } from "../validate";
 import {
   Badge,
   ConfirmDialog,
@@ -11,7 +13,6 @@ import {
   EmptyState,
   ErrorState,
   Field,
-  fmtBytes,
   IconButton,
   LoadingState,
   Modal,
@@ -27,7 +28,7 @@ type Endpoint = { host: string; port: string | null };
 
 export function Users() {
   const toast = useToast();
-  const users = useResource(api.users, 10000);
+  const users = useResource(api.users, POLL_SLOW_MS);
   const nodes = useResource(api.nodes);
   const settings = useResource(api.settings);
   const core = useResource(api.core);
@@ -45,7 +46,7 @@ export function Users() {
     setResetting(u.username);
     try {
       const fresh = await api.resetUserTraffic(u.username);
-      if (users.data) users.set(users.data.map((x) => (x.username === fresh.username ? fresh : x)));
+      users.set((cur) => cur.map((x) => (x.username === fresh.username ? fresh : x)));
       toast("success", `Traffic counters of ${u.username} reset`);
     } catch (e) {
       toast("error", errorMessage(e));
@@ -57,7 +58,7 @@ export function Users() {
   const remove = async (u: User) => {
     try {
       await api.deleteUser(u.username);
-      if (users.data) users.set(users.data.filter((x) => x.username !== u.username));
+      users.set((cur) => cur.filter((x) => x.username !== u.username));
       toast("success", `User ${u.username} deleted`);
     } catch (e) {
       toast("error", errorMessage(e));
@@ -216,7 +217,9 @@ function UserModal({
   const [balance, setBalance] = useState<Balance | "">(user?.balance ?? "");
   const [busy, setBusy] = useState(false);
 
-  const maxInvalid = maxConns !== "" && !/^[1-9]\d*$/.test(maxConns);
+  // The core keeps the limit in a u32.
+  const maxErr = maxConns === "" ? undefined : intError(maxConns, 1, 4294967295);
+  const nameErr = user ? undefined : idError(username.trim());
 
   const submit = async (e: FormEvent) => {
     e.preventDefault();
@@ -260,7 +263,7 @@ function UserModal({
             type="submit"
             form="user-form"
             className="btn-primary"
-            disabled={busy || maxInvalid || (!user && !username.trim())}
+            disabled={busy || !!maxErr || !!nameErr || (!user && !username.trim())}
           >
             {busy && <Spinner />}
             {user ? "Save" : "Create"}
@@ -269,7 +272,7 @@ function UserModal({
       }
     >
       <form id="user-form" onSubmit={submit} className="grid grid-cols-1 gap-4 sm:grid-cols-2">
-        <Field label="Username">
+        <Field label="Username" error={nameErr}>
           {(id) => (
             <input
               id={id}
@@ -364,11 +367,7 @@ function UserModal({
             />
           )}
         </Field>
-        <Field
-          label="Max connections"
-          hint="Concurrent SOCKS connections; empty for no limit."
-          error={maxInvalid ? "A positive whole number" : undefined}
-        >
+        <Field label="Max connections" hint="Concurrent SOCKS connections; empty for no limit." error={maxErr}>
           {(id) => (
             <input
               id={id}
@@ -414,6 +413,7 @@ function CreatedModal({
     <Modal
       title={`Credentials for ${user.username}`}
       onClose={onClose}
+      dismissible={false}
       footer={
         <button className="btn-primary" onClick={onClose}>
           Done

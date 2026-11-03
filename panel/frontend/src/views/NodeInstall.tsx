@@ -1,33 +1,50 @@
-import { useState } from "react";
+import { useId, useState, type KeyboardEvent } from "react";
 import { AlertTriangle, KeyRound } from "lucide-react";
-import { Banner, cls, CopyButton, Modal } from "../ui";
+import { cls } from "../format";
+import { arrowTarget, Banner, CopyButton, Modal } from "../ui";
 
 type Platform = "linux" | "windows" | "openwrt";
 
-function linuxSteps(key: string) {
+// Every snippet hands the key to wirefox-node through WIREFOX_NODE_KEY: a
+// command line is readable by every local user, the environment is not.
+
+export function linuxSteps(key: string) {
   return {
-    shell: `# Keep the key readable by root only
+    shell: `# A system user for the service; the key stays readable by root only
+id wirefox >/dev/null 2>&1 || useradd --system --no-create-home --shell /usr/sbin/nologin wirefox
 install -d -m 700 /etc/wirefox
+install -m 600 /dev/null /etc/wirefox/node.env
 printf 'WIREFOX_NODE_KEY=%s\\n' '${key}' > /etc/wirefox/node.env
-chmod 600 /etc/wirefox/node.env
 
 # Optional: try it in the foreground first (Ctrl+C to stop)
-wirefox-node run --key '${key}'`,
+(set -a; . /etc/wirefox/node.env; /usr/local/bin/wirefox-node run)`,
     unit: `# /etc/systemd/system/wirefox-node.service
 [Unit]
-Description=WireFox exit-node
+Description=WireFox exit-node (managed by wirefox-panel)
 After=network-online.target
 Wants=network-online.target
 
 [Service]
 EnvironmentFile=/etc/wirefox/node.env
-ExecStart=/usr/local/bin/wirefox-node run --key \${WIREFOX_NODE_KEY}
-DynamicUser=yes
+ExecStart=/usr/local/bin/wirefox-node run
 StateDirectory=wirefox-node
-WorkingDirectory=/var/lib/wirefox-node
+StateDirectoryMode=0700
+User=wirefox
+Group=wirefox
 Restart=always
 RestartSec=2
 LimitNOFILE=1048576
+
+# Binding to an interface by name works unprivileged on Linux 5.7 and newer.
+# On older kernels it needs CAP_NET_RAW: replace the empty
+# CapabilityBoundingSet= below with the two commented lines.
+CapabilityBoundingSet=
+#CapabilityBoundingSet=CAP_NET_RAW
+#AmbientCapabilities=CAP_NET_RAW
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
 
 [Install]
 WantedBy=multi-user.target`,
@@ -35,34 +52,41 @@ WantedBy=multi-user.target`,
   };
 }
 
-function windowsScript(key: string): string {
+export function windowsScript(key: string): string {
   return `# Run in an elevated PowerShell; wirefox-node.exe is in C:\\WireFox
-$key = '${key}'
+# The key is kept in a machine environment variable. setx only reaches new
+# processes, so this window gets it too for the foreground test.
+setx /M WIREFOX_NODE_KEY '${key}'
+$env:WIREFOX_NODE_KEY = '${key}'
 
 # Optional: try it in the foreground first (Ctrl+C to stop)
-& 'C:\\WireFox\\wirefox-node.exe' run --key $key
+& 'C:\\WireFox\\wirefox-node.exe' run
 
-# Start it at boot, restarting it if it ever exits
-$action = New-ScheduledTaskAction -Execute 'C:\\WireFox\\wirefox-node.exe' -Argument "run --key $key" -WorkingDirectory 'C:\\WireFox'
+# Start it at boot as SYSTEM, restarting it if it ever exits; its saved
+# settings go to %ProgramData%\\wirefox-node
+$action = New-ScheduledTaskAction -Execute 'C:\\WireFox\\wirefox-node.exe' -Argument 'run' -WorkingDirectory 'C:\\WireFox'
 $trigger = New-ScheduledTaskTrigger -AtStartup
 $settings = New-ScheduledTaskSettingsSet -ExecutionTimeLimit ([TimeSpan]::Zero) -RestartCount 999 -RestartInterval (New-TimeSpan -Minutes 1)
 Register-ScheduledTask -TaskName 'WireFox node' -Action $action -Trigger $trigger -Settings $settings -User 'SYSTEM' -RunLevel Highest
 Start-ScheduledTask -TaskName 'WireFox node'`;
 }
 
-function openwrtSteps(key: string) {
+export function openwrtSteps(key: string) {
   return {
-    shell: `mkdir -p /etc/wirefox
+    shell: `mkdir -p -m 700 /etc/wirefox
 echo '${key}' > /etc/wirefox/node.key
 chmod 600 /etc/wirefox/node.key`,
     init: `#!/bin/sh /etc/rc.common
 # /etc/init.d/wirefox-node
+# /var is in RAM on OpenWrt, so the saved settings go to flash in
+# /etc/wirefox-node and survive a reboot while the panel is away.
 START=99
 USE_PROCD=1
 
 start_service() {
 	procd_open_instance
-	procd_set_param command /usr/bin/wirefox-node run --key "$(cat /etc/wirefox/node.key)"
+	procd_set_param command /usr/bin/wirefox-node run --state-dir /etc/wirefox-node
+	procd_set_param env WIREFOX_NODE_KEY="$(cat /etc/wirefox/node.key)"
 	procd_set_param respawn 3600 5 0
 	procd_set_param stdout 1
 	procd_set_param stderr 1
@@ -96,8 +120,22 @@ const TABS: { id: Platform; label: string }[] = [
 // so this is the one chance to copy it.
 export function NodeKeyModal({ nodeId, nodeKey, onClose }: { nodeId: string; nodeKey: string; onClose: () => void }) {
   const [platform, setPlatform] = useState<Platform>("linux");
+  const tabsId = useId();
   const linux = linuxSteps(nodeKey);
   const openwrt = openwrtSteps(nodeKey);
+
+  const onTabKey = (e: KeyboardEvent<HTMLDivElement>) => {
+    const next = arrowTarget(
+      e.key,
+      TABS.findIndex((t) => t.id === platform),
+      TABS.length,
+      "horizontal",
+    );
+    if (next === null) return;
+    e.preventDefault();
+    setPlatform(TABS[next].id);
+    e.currentTarget.querySelectorAll<HTMLElement>("[role=tab]")[next]?.focus();
+  };
 
   return (
     <Modal
@@ -108,6 +146,7 @@ export function NodeKeyModal({ nodeId, nodeKey, onClose }: { nodeId: string; nod
       }
       size="xl"
       onClose={onClose}
+      dismissible={false}
       footer={
         <button className="btn-primary" onClick={onClose}>
           I have saved the key
@@ -128,19 +167,29 @@ export function NodeKeyModal({ nodeId, nodeKey, onClose }: { nodeId: string; nod
             {nodeKey}
           </code>
           <p className="mt-1.5 text-xs text-slate-500">
-            Install the <span className="font-mono">wirefox-node</span> binary on the exit-node, then start it with{" "}
-            <span className="font-mono text-slate-300">wirefox-node run --key &lt;KEY&gt;</span>. It connects to this
-            panel, receives its tunnel settings and keeps working from its saved settings when the panel is away.
+            Install the <span className="font-mono">wirefox-node</span> binary on the exit-node and start{" "}
+            <span className="font-mono text-slate-300">wirefox-node run</span> with the key in the{" "}
+            <span className="font-mono text-slate-300">WIREFOX_NODE_KEY</span> environment variable, as below. It
+            connects to this panel, receives its tunnel settings and keeps working from its saved settings when the
+            panel is away.
           </p>
         </div>
 
         <div>
-          <div className="mb-3 flex gap-1 rounded-xl border border-ink-600/60 bg-ink-900/60 p-1" role="tablist">
+          <div
+            className="mb-3 flex gap-1 rounded-xl border border-ink-600/60 bg-ink-900/60 p-1"
+            role="tablist"
+            aria-label="Platform"
+            onKeyDown={onTabKey}
+          >
             {TABS.map((t) => (
               <button
                 key={t.id}
+                id={`${tabsId}-${t.id}`}
                 role="tab"
                 aria-selected={platform === t.id}
+                aria-controls={`${tabsId}-panel`}
+                tabIndex={platform === t.id ? 0 : -1}
                 onClick={() => setPlatform(t.id)}
                 className={cls(
                   "flex-1 rounded-lg px-3 py-1.5 text-sm font-medium transition",
@@ -151,10 +200,10 @@ export function NodeKeyModal({ nodeId, nodeKey, onClose }: { nodeId: string; nod
               </button>
             ))}
           </div>
-          <div className="space-y-4" role="tabpanel">
+          <div className="space-y-4" id={`${tabsId}-panel`} role="tabpanel" aria-labelledby={`${tabsId}-${platform}`}>
             {platform === "linux" && (
               <>
-                <Snippet title="1. Store the key (as root)" code={linux.shell} />
+                <Snippet title="1. Create the service user and store the key (as root)" code={linux.shell} />
                 <Snippet title="2. systemd unit (binary in /usr/local/bin)" code={linux.unit} />
                 <Snippet title="3. Enable and start" code={linux.enable} />
               </>
@@ -163,7 +212,10 @@ export function NodeKeyModal({ nodeId, nodeKey, onClose }: { nodeId: string; nod
             {platform === "openwrt" && (
               <>
                 <Snippet title="1. Store the key" code={openwrt.shell} />
-                <Snippet title="2. procd init script (binary in /usr/bin)" code={openwrt.init} />
+                <Snippet
+                  title="2. procd init script (binary in /usr/bin, saved settings in /etc/wirefox-node)"
+                  code={openwrt.init}
+                />
                 <Snippet title="3. Enable and start" code={openwrt.enable} />
               </>
             )}

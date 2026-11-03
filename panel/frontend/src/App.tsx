@@ -13,10 +13,11 @@ import {
   type LucideIcon,
 } from "lucide-react";
 import { api, setUnauthorizedHandler } from "./api";
-import { useResource } from "./hooks";
+import { cls } from "./format";
+import { POLL_MS, useResource } from "./hooks";
 import { coreState } from "./status";
 import type { Overview } from "./types";
-import { cls, Logo, StatusDot, useToast } from "./ui";
+import { Logo, StatusDot, useToast } from "./ui";
 import { ActivityView } from "./views/Activity";
 import { Connections } from "./views/Connections";
 import { Core } from "./views/Core";
@@ -69,7 +70,7 @@ export default function App() {
 
 function Shell({ user, onSignedOut }: { user: string; onSignedOut: () => void }) {
   const [view, setView] = useState<ViewId>(viewFromHash);
-  const overview = useResource<Overview>(api.overview, 5000);
+  const overview = useResource<Overview>(api.overview, POLL_MS);
 
   useEffect(() => {
     const onHash = () => setView(viewFromHash());

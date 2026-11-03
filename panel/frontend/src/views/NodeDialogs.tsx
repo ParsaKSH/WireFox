@@ -1,24 +1,12 @@
 import { useCallback, useId, useState, type FormEvent } from "react";
 import { RefreshCw } from "lucide-react";
 import { api, errorMessage } from "../api";
+import { cls, fmtClock } from "../format";
 import { useResource } from "../hooks";
 import { logLevelClass } from "../status";
 import type { Binding, NetInterface, Node, NodePatch } from "../types";
-import {
-  cls,
-  ErrorState,
-  Field,
-  fmtClock,
-  IconButton,
-  LoadingState,
-  Modal,
-  Select,
-  Spinner,
-  Toggle,
-  useToast,
-} from "../ui";
-
-const NODE_ID = /^[A-Za-z0-9][A-Za-z0-9._-]*$/;
+import { ErrorState, Field, IconButton, LoadingState, Modal, Select, Spinner, Toggle, useToast } from "../ui";
+import { idError, intError } from "../validate";
 
 export function AddNodeModal({
   onClose,
@@ -31,7 +19,7 @@ export function AddNodeModal({
   const [id, setId] = useState("");
   const [name, setName] = useState("");
   const [busy, setBusy] = useState(false);
-  const idInvalid = id !== "" && !NODE_ID.test(id);
+  const idErr = idError(id);
 
   const submit = async (e: FormEvent) => {
     e.preventDefault();
@@ -54,7 +42,7 @@ export function AddNodeModal({
           <button className="btn-ghost" onClick={onClose}>
             Cancel
           </button>
-          <button type="submit" form="add-node" className="btn-primary" disabled={busy || idInvalid}>
+          <button type="submit" form="add-node" className="btn-primary" disabled={busy || !!idErr}>
             {busy && <Spinner />} Create and show key
           </button>
         </>
@@ -64,7 +52,7 @@ export function AddNodeModal({
         <Field
           label="ID"
           hint="Short identifier used in user restrictions and logs. Leave empty to have one generated."
-          error={idInvalid ? "Letters, digits, dot, dash and underscore, starting with a letter or digit" : undefined}
+          error={idErr}
         >
           {(fid) => (
             <input
@@ -194,10 +182,22 @@ function BindingEditor({
   );
 }
 
-function intError(v: string, min: number, max: number): string | undefined {
-  if (!/^\d+$/.test(v)) return "A whole number";
-  const n = Number(v);
-  return n < min || n > max ? `Between ${min} and ${max}` : undefined;
+// The edit form sends only what the operator changed. Name and enabled live in
+// the core and can only be saved while it answers; the tunnel settings reach
+// the node over its agent connection, so they must not fail along with them.
+export function changedFields(node: Node, form: Required<NodePatch>): NodePatch {
+  const c = node.config;
+  const sameBinding = (a: Binding, b: Binding) => a.interface === b.interface && a.source_ip === b.source_ip;
+  const patch: NodePatch = {};
+  if (form.name !== node.name) patch.name = form.name;
+  if (form.enabled !== node.enabled) patch.enabled = form.enabled;
+  if (form.pool_size !== c.pool_size) patch.pool_size = form.pool_size;
+  if (form.max_extra !== c.max_extra) patch.max_extra = form.max_extra;
+  if (form.connect_timeout_secs !== c.connect_timeout_secs) patch.connect_timeout_secs = form.connect_timeout_secs;
+  if (form.allow_local !== c.allow_local) patch.allow_local = form.allow_local;
+  if (!sameBinding(form.egress, c.egress)) patch.egress = form.egress;
+  if (!sameBinding(form.uplink, c.uplink)) patch.uplink = form.uplink;
+  return patch;
 }
 
 export function EditNodeModal({
@@ -223,10 +223,22 @@ export function EditNodeModal({
   const [refreshing, setRefreshing] = useState(false);
   const [busy, setBusy] = useState(false);
 
+  const nameErr = name.trim() === "" && node.name !== "" ? "A name can be changed but not removed" : undefined;
   const poolErr = intError(poolSize, 1, 4096);
   const extraErr = intError(maxExtra, 0, 65536);
   const timeoutErr = intError(timeout, 1, 600);
   const connected = !!node.agent?.connected;
+  const patch = changedFields(node, {
+    name: name.trim(),
+    enabled,
+    pool_size: Number(poolSize),
+    max_extra: Number(maxExtra),
+    connect_timeout_secs: Number(timeout),
+    allow_local: allowLocal,
+    egress,
+    uplink,
+  });
+  const dirty = Object.keys(patch).length > 0;
 
   const refreshInterfaces = async () => {
     setRefreshing(true);
@@ -241,16 +253,6 @@ export function EditNodeModal({
 
   const submit = async (e: FormEvent) => {
     e.preventDefault();
-    const patch: NodePatch = {
-      name: name.trim(),
-      enabled,
-      pool_size: Number(poolSize),
-      max_extra: Number(maxExtra),
-      connect_timeout_secs: Number(timeout),
-      allow_local: allowLocal,
-      egress,
-      uplink,
-    };
     setBusy(true);
     try {
       onSaved(await api.updateNode(node.id, patch));
@@ -279,7 +281,7 @@ export function EditNodeModal({
             type="submit"
             form="edit-node"
             className="btn-primary"
-            disabled={busy || !!poolErr || !!extraErr || !!timeoutErr}
+            disabled={busy || !dirty || !!nameErr || !!poolErr || !!extraErr || !!timeoutErr}
           >
             {busy && <Spinner />} Save
           </button>
@@ -288,7 +290,7 @@ export function EditNodeModal({
     >
       <form id="edit-node" onSubmit={submit} className="space-y-5">
         <div className="grid grid-cols-1 gap-4 sm:grid-cols-2">
-          <Field label="Name">
+          <Field label="Name" error={nameErr}>
             {(id) => <input id={id} className="input" value={name} onChange={(e) => setName(e.target.value)} />}
           </Field>
           <div className="flex items-end gap-6 pb-2">
@@ -297,8 +299,9 @@ export function EditNodeModal({
           </div>
         </div>
         <p className="-mt-2 text-[11px] leading-relaxed text-slate-500">
-          A disabled node keeps its agent connection but runs no tunnel. Local targets are loopback and private networks
-          on the node's side; leave them blocked unless users need them.
+          A disabled node keeps its agent connection but runs no tunnel. Local targets are the node itself (loopback and
+          its own addresses) and link-local addresses such as the cloud metadata service at 169.254.169.254; leave them
+          blocked unless users need them. Hosts on the node's private LAN are reachable either way.
         </p>
 
         <div className="grid grid-cols-1 gap-4 sm:grid-cols-3">

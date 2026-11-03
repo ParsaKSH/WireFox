@@ -37,6 +37,16 @@ export function setUnauthorizedHandler(handler: (() => void) | null) {
   onUnauthorized = handler;
 }
 
+// The panel answers {"error": "..."}, but bodies it passes through from the
+// core can be plain text, e.g. a 422 naming the field that failed to parse.
+function failureMessage(res: Response, data: unknown, text: string): string {
+  if (data && typeof data === "object" && "error" in data && typeof data.error === "string") return data.error;
+  const plain = text.trim();
+  // HTML is some proxy's error page, not worth showing.
+  if (data === null && plain && !plain.startsWith("<")) return `${res.status}: ${plain.slice(0, 200)}`;
+  return `${res.status} ${res.statusText || "request failed"}`;
+}
+
 async function request<T>(method: string, path: string, body?: unknown): Promise<T> {
   let res: Response;
   try {
@@ -63,11 +73,7 @@ async function request<T>(method: string, path: string, body?: unknown): Promise
   if (!res.ok) {
     // The login form handles its own 401 (wrong password) without dropping the session.
     if (res.status === 401 && path !== "/login") onUnauthorized?.();
-    const message =
-      data && typeof data === "object" && "error" in data && typeof data.error === "string"
-        ? data.error
-        : `${res.status} ${res.statusText || "request failed"}`;
-    throw new ApiError(res.status, message);
+    throw new ApiError(res.status, failureMessage(res, data, text));
   }
   return data as T;
 }

@@ -6,9 +6,17 @@ export interface Resource<T> {
   error: string | null;
   loading: boolean;
   reload: () => Promise<void>;
-  // Replaces the cached value, e.g. with the object a mutation returned.
-  set: (data: T) => void;
+  // Replaces the cached value, e.g. with the object a mutation returned. An
+  // updater function gets the current value, so a mutation that finishes after
+  // a poll merges into that poll's answer rather than into the data it started
+  // from; it does nothing while nothing has loaded yet.
+  set: (next: T | ((current: T) => T)) => void;
 }
+
+// How often views poll: live tables, the usual status refresh, slower lists.
+export const POLL_LIVE_MS = 3000;
+export const POLL_MS = 5000;
+export const POLL_SLOW_MS = 10000;
 
 // Loads data on mount and whenever `load` changes identity (wrap it in
 // useCallback with its parameters as dependencies), and with an interval polls
@@ -52,9 +60,12 @@ export function useResource<T>(load: () => Promise<T>, intervalMs?: number): Res
     };
   }, [reload, intervalMs]);
 
-  const set = useCallback((v: T) => {
+  const set = useCallback((next: T | ((current: T) => T)) => {
     seq.current++;
-    setData(v);
+    setData((current) => {
+      if (!(next instanceof Function)) return next;
+      return current === undefined ? current : next(current);
+    });
     setError(null);
     setLoading(false);
   }, []);

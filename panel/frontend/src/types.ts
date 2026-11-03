@@ -98,6 +98,8 @@ export interface NodeAgent {
   last_error: string;
   config_version: number;
   uptime_secs: number;
+  // Time since the node's tunnel connected; 0 while it is not connected.
+  connected_secs: number;
   active_streams: number;
   total_streams: number;
   interfaces: NetInterface[];

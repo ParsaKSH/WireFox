@@ -1,18 +1,15 @@
 import { useCallback, useState } from "react";
 import { Cable, Pause, Play, RefreshCw, X } from "lucide-react";
 import { api, errorMessage } from "../api";
-import { useResource } from "../hooks";
+import { fmtBytes, fmtDateTime, fmtDuration, nowSecs } from "../format";
+import { POLL_LIVE_MS, useResource } from "../hooks";
 import type { Connection } from "../types";
 import {
   Badge,
   EmptyState,
   ErrorState,
-  fmtBytes,
-  fmtDateTime,
-  fmtDuration,
   IconButton,
   LoadingState,
-  nowSecs,
   PageHeader,
   Select,
   Spinner,
@@ -28,7 +25,7 @@ export function Connections() {
   const [killing, setKilling] = useState<number | null>(null);
 
   const load = useCallback(() => api.connections({ user, node }), [user, node]);
-  const conns = useResource(load, paused ? undefined : 3000);
+  const conns = useResource(load, paused ? undefined : POLL_LIVE_MS);
   // Filter choices come from the full lists, not from what the filter left over.
   const users = useResource(api.users);
   const nodes = useResource(api.nodes);
@@ -37,7 +34,7 @@ export function Connections() {
     setKilling(c.id);
     try {
       await api.killConnection(c.id);
-      if (conns.data) conns.set(conns.data.filter((x) => x.id !== c.id));
+      conns.set((cur) => cur.filter((x) => x.id !== c.id));
       toast("success", `Closed connection to ${c.target}`);
     } catch (e) {
       toast("error", errorMessage(e));
@@ -48,6 +45,7 @@ export function Connections() {
 
   const list = conns.data ?? [];
   const now = nowSecs();
+  const refreshing = paused ? "paused" : `refreshing every ${POLL_LIVE_MS / 1000} s`;
 
   return (
     <div>
@@ -55,7 +53,7 @@ export function Connections() {
         title="Connections"
         subtitle={
           conns.data
-            ? `${list.length} open SOCKS ${list.length === 1 ? "session" : "sessions"}${paused ? " · paused" : " · refreshing every 3 s"}`
+            ? `${list.length} open SOCKS ${list.length === 1 ? "session" : "sessions"} · ${refreshing}`
             : "Open SOCKS sessions"
         }
         actions={

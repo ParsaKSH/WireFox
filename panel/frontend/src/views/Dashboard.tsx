@@ -1,21 +1,12 @@
 import type { ReactNode } from "react";
 import { ArrowDown, ArrowDownUp, ArrowUp, Cable, Cpu, PlugZap, Server, Users } from "lucide-react";
 import type { ViewId } from "../App";
+import { fmtBytes, fmtDuration } from "../format";
 import type { Resource } from "../hooks";
 import { useTicker } from "../hooks";
 import { coreState } from "../status";
 import type { Overview } from "../types";
-import {
-  Banner,
-  ErrorState,
-  fmtBytes,
-  fmtDuration,
-  LoadingState,
-  PageHeader,
-  SectionTitle,
-  StatusDot,
-  type Tone,
-} from "../ui";
+import { Banner, ErrorState, LoadingState, PageHeader, SectionTitle, StatusDot, type Tone } from "../ui";
 import { EventList } from "./Activity";
 import { TrafficChart } from "./TrafficChart";
 
