@@ -73,7 +73,7 @@ impl Dialer {
     pub fn new(local: EgressSpec, connect_timeout: Duration, allow_local: bool) -> Self {
         let plan = build_plan(&local);
         if let Err(e) = &plan {
-            warn!(egress = ?local, error = %e, "egress is not usable yet, will keep retrying");
+            warn!(egress = %local, error = %e, "egress is not usable yet, will keep retrying");
         }
         Dialer {
             local,
@@ -92,6 +92,12 @@ impl Dialer {
 
     pub fn effective(&self) -> EgressSpec {
         self.override_spec.read().clone().unwrap_or_else(|| self.local.clone())
+    }
+
+    /// Why the effective spec can't be used right now (say its interface is
+    /// gone), or `None` if dials can go out.
+    pub fn error(&self) -> Option<String> {
+        self.plan().err().map(|e| e.to_string())
     }
 
     /// Apply a server-pushed override (`None` goes back to the local config).
@@ -490,9 +496,11 @@ mod tests {
     #[tokio::test]
     async fn unresolvable_override_fails_closed() {
         let dialer = Dialer::new(EgressSpec::default(), Duration::from_secs(2), true);
+        assert_eq!(dialer.error(), None);
         let missing = EgressSpec { interface: Some("does-not-exist0".into()), source_ip: None };
         assert!(dialer.set_override(Some(missing.clone())).is_some());
         assert_eq!(dialer.effective(), missing);
+        assert!(dialer.error().unwrap().contains("does-not-exist0"));
         let err = dialer.dial_addrs(vec![addr("127.0.0.1:9")]).await.unwrap_err();
         assert_eq!(err.kind(), io::ErrorKind::NotFound);
 
@@ -501,5 +509,6 @@ mod tests {
         assert_eq!(dialer.effective(), src);
         assert_eq!(dialer.set_override(None), None);
         assert!(dialer.effective().is_default());
+        assert_eq!(dialer.error(), None);
     }
 }

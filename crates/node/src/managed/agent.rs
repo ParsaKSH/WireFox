@@ -18,6 +18,7 @@ use tonic::transport::{Channel, Endpoint, Uri};
 use tonic::{Code, Request};
 use tracing::{error, info, warn};
 use wirefox_common::net::tune_tcp;
+use wirefox_common::proto::EgressSpec;
 
 use crate::egress::{list_interfaces, Dialer};
 use crate::managed::logs::LogBuffer;
@@ -70,12 +71,19 @@ impl Managed {
         }
 
         let mut backoff = MIN_BACKOFF;
+        let mut default_route = false;
         loop {
+            let uplink = self.supervisor.uplink();
+            let route = if default_route { EgressSpec::default() } else { uplink.clone() };
             let started = Instant::now();
-            let result = self.session().await;
+            let result = self.session(route).await;
             if started.elapsed() > STABLE_CONNECTION {
                 backoff = MIN_BACKOFF;
             }
+            // The uplink comes from the panel and may be wrong (a typo, a
+            // modem that went away). Every other try after a failure goes over
+            // the default route, so the panel can still reach the node to fix it.
+            default_route = result.is_err() && !default_route && !uplink.is_default();
             let delay = match result {
                 Ok(()) => {
                     info!("the panel closed the connection");
@@ -94,14 +102,17 @@ impl Managed {
                     backoff
                 }
             };
+            if default_route {
+                info!(%uplink, "trying the panel over the default route next");
+            }
             let jitter = Duration::from_millis(rand::random::<u64>() % (delay.as_millis() as u64 / 4 + 1));
             tokio::time::sleep(delay + jitter).await;
             backoff = (backoff * 2).min(MAX_BACKOFF);
         }
     }
 
-    async fn session(&mut self) -> Result<()> {
-        let mut client = AgentClient::new(self.connect().await?);
+    async fn session(&mut self, route: EgressSpec) -> Result<()> {
+        let mut client = AgentClient::new(self.connect(route).await?);
         let (tx, rx) = mpsc::channel(32);
         let outbound = Outbound(tx);
         outbound.send(node_message::Msg::Hello(self.hello())).await?;
@@ -146,16 +157,16 @@ impl Managed {
         }
     }
 
-    /// Open the HTTP/2 connection: TCP through the uplink, then TLS with the
+    /// Open the HTTP/2 connection: TCP through `route`, then TLS with the
     /// panel's certificate pinned.
-    async fn connect(&self) -> Result<Channel> {
+    async fn connect(&self, route: EgressSpec) -> Result<Channel> {
         let panel = Arc::new(parse_host_port(&self.key.panel)?);
-        let uplink = Arc::new(Dialer::new(self.supervisor.uplink(), CONNECT_TIMEOUT, true));
+        let dialer = Arc::new(Dialer::new(route, CONNECT_TIMEOUT, true));
         let tls = TlsConnector::from(self.tls.clone());
         let connector = tower::service_fn(move |_: Uri| {
-            let (panel, uplink, tls) = (panel.clone(), uplink.clone(), tls.clone());
+            let (panel, dialer, tls) = (panel.clone(), dialer.clone(), tls.clone());
             async move {
-                let tcp = uplink.dial(&panel).await?;
+                let tcp = dialer.dial(&panel).await?;
                 tune_tcp(&tcp)?;
                 let server_name = ServerName::try_from(PANEL_SERVER_NAME).map_err(io::Error::other)?;
                 let stream = tls.connect(server_name, tcp).await?;
@@ -198,8 +209,14 @@ impl Managed {
             tunnel::TunnelState::Connected => TunnelState::Connected,
             tunnel::TunnelState::Error => TunnelState::Error,
         };
-        // A rejected config matters more than why the running tunnel is down.
-        let last_error = self.supervisor.config_error().map(str::to_string).or(tunnel.last_error);
+        // A rejected config matters more than why the running tunnel is down,
+        // and that more than an egress that fails every stream of a working tunnel.
+        let last_error = self
+            .supervisor
+            .config_error()
+            .map(str::to_string)
+            .or(tunnel.last_error)
+            .or_else(|| self.supervisor.egress_error());
         Status {
             config_version: self.supervisor.config_version(),
             tunnel_state: tunnel_state.into(),

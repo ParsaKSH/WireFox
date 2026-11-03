@@ -14,7 +14,7 @@ use tracing_subscriber::layer::{Context, Layer};
 use crate::pb::LogLine;
 
 /// Lines kept by the managed node.
-pub const DEFAULT_CAPACITY: usize = 2000;
+const DEFAULT_CAPACITY: usize = 2000;
 
 /// A bounded ring of log lines; cloning shares the buffer.
 #[derive(Clone)]
@@ -45,6 +45,13 @@ impl LogBuffer {
     /// A tracing layer that records every event into this buffer.
     pub fn layer(&self) -> LogLayer {
         LogLayer(self.clone())
+    }
+}
+
+impl Default for LogBuffer {
+    /// A buffer of the size the managed node uses.
+    fn default() -> Self {
+        LogBuffer::new(DEFAULT_CAPACITY)
     }
 }
 

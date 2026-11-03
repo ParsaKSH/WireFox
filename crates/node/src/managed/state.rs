@@ -25,19 +25,23 @@ pub struct StateDir {
 }
 
 impl StateDir {
-    /// Create the directory if needed and make sure it is writable.
+    /// Create the directory if needed, private to the service, and make sure
+    /// it is writable.
     pub fn open(path: &Path) -> Result<Self> {
+        let not_writable = || {
+            format!(
+                "the state directory {} is not writable; run as a user that may write it or pick another one with \
+                 --state-dir",
+                path.display()
+            )
+        };
+        create_private_dir(path).with_context(not_writable)?;
+        // Windows has no mode bits, and %ProgramData% lets every user read.
+        #[cfg(windows)]
+        super::acl::restrict_dir(path)
+            .with_context(|| format!("making the state directory {} private", path.display()))?;
         let probe = path.join(".write-test");
-        create_private_dir(path)
-            .and_then(|()| write_atomic_private(&probe, b""))
-            .and_then(|()| std::fs::remove_file(&probe))
-            .with_context(|| {
-                format!(
-                    "the state directory {} is not writable; run as a user that may write it or pick another one \
-                     with --state-dir",
-                    path.display()
-                )
-            })?;
+        write_atomic_private(&probe, b"").and_then(|()| std::fs::remove_file(&probe)).with_context(not_writable)?;
         Ok(StateDir { path: path.to_owned() })
     }
 
@@ -75,6 +79,28 @@ fn create_private_dir(path: &Path) -> io::Result<()> {
     builder.create(path)
 }
 
+/// A path under the system temp dir, removed again on drop.
+#[cfg(test)]
+pub(crate) struct TempDir(PathBuf);
+
+#[cfg(test)]
+impl TempDir {
+    pub fn new(name: &str) -> Self {
+        TempDir(std::env::temp_dir().join(format!("wirefox-{name}-{}", wirefox_common::random_token(8))))
+    }
+
+    pub fn path(&self) -> &Path {
+        &self.0
+    }
+}
+
+#[cfg(test)]
+impl Drop for TempDir {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.0);
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -82,8 +108,8 @@ mod tests {
 
     #[test]
     fn tunnel_config_round_trip() {
-        let dir = std::env::temp_dir().join(format!("wirefox-state-{}", wirefox_common::random_token(8)));
-        let state = StateDir::open(&dir.join("nested")).unwrap();
+        let dir = TempDir::new("state");
+        let state = StateDir::open(&dir.path().join("nested")).unwrap();
         assert!(state.load_tunnel().unwrap().is_none());
 
         let cfg = TunnelConfig {
@@ -108,29 +134,27 @@ mod tests {
             let mode = std::fs::metadata(state.path()).unwrap().permissions().mode();
             assert_eq!(mode & 0o777, 0o700);
         }
-        std::fs::remove_dir_all(dir).unwrap();
     }
 
     #[test]
     fn corrupt_state_is_an_error() {
-        let dir = std::env::temp_dir().join(format!("wirefox-state-{}", wirefox_common::random_token(8)));
-        let state = StateDir::open(&dir).unwrap();
-        std::fs::write(dir.join(TUNNEL_FILE), "{").unwrap();
+        let dir = TempDir::new("state");
+        let state = StateDir::open(dir.path()).unwrap();
+        std::fs::write(dir.path().join(TUNNEL_FILE), "{").unwrap();
         assert!(state.load_tunnel().is_err());
-        std::fs::remove_dir_all(dir).unwrap();
     }
 
     #[cfg(unix)]
     #[test]
     fn unwritable_dir_is_reported() {
         use std::os::unix::fs::PermissionsExt;
-        let dir = std::env::temp_dir().join(format!("wirefox-state-{}", wirefox_common::random_token(8)));
-        std::fs::create_dir(&dir).unwrap();
-        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o500)).unwrap();
-        // Root may write anyway, so only check the outcome when it fails.
-        if let Err(err) = StateDir::open(&dir) {
-            assert!(format!("{err:#}").contains("is not writable"), "{err:#}");
-        }
-        std::fs::remove_dir_all(dir).unwrap();
+        let dir = TempDir::new("state");
+        std::fs::create_dir(dir.path()).unwrap();
+        std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o500)).unwrap();
+        let Err(err) = StateDir::open(dir.path()) else {
+            eprintln!("skipped: this user may write to read-only directories (root?)");
+            return;
+        };
+        assert!(format!("{err:#}").contains("is not writable"), "{err:#}");
     }
 }

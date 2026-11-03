@@ -1,8 +1,9 @@
+use std::future::Future;
 use std::path::{Path, PathBuf};
 
 use anyhow::Result;
 use clap::{Parser, Subcommand};
-use wirefox_node::managed::{self, LogBuffer, Managed, NodeKey, StateDir};
+use wirefox_node::managed::{default_state_dir, LogBuffer, Managed, NodeKey, StateDir};
 use wirefox_node::{egress, Node, NodeConfig};
 
 #[cfg(feature = "mimalloc")]
@@ -24,8 +25,10 @@ struct Cli {
 enum Cmd {
     /// Connect to the server and start forwarding.
     ///
-    /// Standalone, the tunnel is set up from a config file. With --key the node
-    /// is managed by wirefox-panel, which sends it the tunnel config.
+    /// Standalone, the tunnel is set up from a config file. Given a node key
+    /// (in WIREFOX_NODE_KEY, which keeps it off the command line, or with
+    /// --key), the node is managed by wirefox-panel, which sends it the tunnel
+    /// config.
     Run {
         /// Path to the config file.
         #[arg(short, long, default_value = "node.toml", conflicts_with = "key")]
@@ -54,56 +57,33 @@ fn main() -> Result<()> {
             }
             Ok(())
         }
-        Cmd::Run { key: Some(key), state_dir, .. } => {
-            run_managed(&key, &state_dir.unwrap_or_else(managed::default_state_dir))
-        }
+        Cmd::Run { key: Some(key), state_dir, .. } => run_managed(&key, &state_dir.unwrap_or_else(default_state_dir)),
         Cmd::Run { config, .. } => run_standalone(&config),
     }
 }
 
 fn run_standalone(config: &Path) -> Result<()> {
     wirefox_common::init_tracing("info");
-    let cfg = NodeConfig::load(config)?;
-    tokio::runtime::Builder::new_multi_thread().enable_all().build()?.block_on(async {
-        let node = Node::new(cfg)?;
-        tracing::info!(version = wirefox_common::VERSION, "wirefox-node starting");
-        tokio::select! {
-            _ = node.run() => {}
-            _ = tokio::signal::ctrl_c() => tracing::info!("shutting down"),
-        }
-        Ok(())
-    })
+    let node = Node::new(NodeConfig::load(config)?)?;
+    tracing::info!(version = wirefox_common::VERSION, "wirefox-node starting");
+    run_until_ctrl_c(node.run())
 }
 
 fn run_managed(key: &str, state_dir: &Path) -> Result<()> {
-    let logs = LogBuffer::new(managed::logs::DEFAULT_CAPACITY);
-    init_tracing_with_buffer(&logs);
-    let key = NodeKey::parse(key)?;
-    let state = StateDir::open(state_dir)?;
-    tokio::runtime::Builder::new_multi_thread().enable_all().build()?.block_on(async {
-        let node = Managed::new(key, state, logs)?;
-        tracing::info!(version = wirefox_common::VERSION, state_dir = %state_dir.display(), "wirefox-node starting in managed mode");
-        tokio::select! {
-            () = node.run() => {}
-            _ = tokio::signal::ctrl_c() => tracing::info!("shutting down"),
-        }
-        Ok(())
-    })
+    let logs = LogBuffer::default();
+    // Every line also goes to the buffer, for the panel to fetch.
+    wirefox_common::init_tracing_with("info", logs.layer());
+    let node = Managed::new(NodeKey::parse(key)?, StateDir::open(state_dir)?, logs)?;
+    tracing::info!(version = wirefox_common::VERSION, state_dir = %state_dir.display(), "wirefox-node starting in managed mode");
+    run_until_ctrl_c(node.run())
 }
 
-/// The same console output as [`wirefox_common::init_tracing`], plus a copy of
-/// every line in `logs` for the panel to fetch.
-fn init_tracing_with_buffer(logs: &LogBuffer) {
-    use std::io::IsTerminal;
-    use tracing_subscriber::layer::SubscriberExt;
-    use tracing_subscriber::util::SubscriberInitExt;
-    use tracing_subscriber::{fmt, EnvFilter};
-
-    let filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info"));
-    let ansi = std::io::stdout().is_terminal();
-    tracing_subscriber::registry()
-        .with(filter)
-        .with(fmt::layer().with_target(false).with_ansi(ansi))
-        .with(logs.layer())
-        .init();
+fn run_until_ctrl_c(task: impl Future<Output = ()>) -> Result<()> {
+    tokio::runtime::Builder::new_multi_thread().enable_all().build()?.block_on(async {
+        tokio::select! {
+            () = task => {}
+            _ = tokio::signal::ctrl_c() => tracing::info!("shutting down"),
+        }
+    });
+    Ok(())
 }

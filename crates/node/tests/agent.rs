@@ -151,8 +151,23 @@ fn panel_cert() -> CertKey {
     CertKey { chain: vec![ck.cert.der().clone()], key: PrivatePkcs8KeyDer::from(ck.signing_key.serialize_der()).into() }
 }
 
-fn temp_dir() -> PathBuf {
-    std::env::temp_dir().join(format!("wirefox-agent-{}", wirefox_common::random_token(8)))
+/// A state directory path, removed again on drop.
+struct TempDir(PathBuf);
+
+impl TempDir {
+    fn new() -> Self {
+        TempDir(std::env::temp_dir().join(format!("wirefox-agent-{}", wirefox_common::random_token(8))))
+    }
+
+    fn state(&self) -> StateDir {
+        StateDir::open(&self.0).unwrap()
+    }
+}
+
+impl Drop for TempDir {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.0);
+    }
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -162,8 +177,8 @@ async fn managed_node_follows_the_panel() {
 
     let cert = panel_cert();
     let mut panel = Panel::start("127.0.0.1:0".parse().unwrap(), &cert).await;
-    let dir = temp_dir();
-    let node = Managed::new(panel.key(&panel.secret), StateDir::open(&dir).unwrap(), logs).unwrap();
+    let dir = TempDir::new();
+    let node = Managed::new(panel.key(&panel.secret), dir.state(), logs).unwrap();
     let node = tokio::spawn(node.run());
 
     let mut session = panel.session().await;
@@ -198,7 +213,7 @@ async fn managed_node_follows_the_panel() {
     };
     assert!(!status.last_error.is_empty());
     assert_eq!(status.connected_secs, 0);
-    assert_eq!(StateDir::open(&dir).unwrap().load_tunnel().unwrap(), Some(config));
+    assert_eq!(dir.state().load_tunnel().unwrap().as_ref(), Some(&config));
 
     let fetch_logs = command::Kind::FetchLogs(FetchLogs { lines: 500 });
     session.send(panel_message::Msg::Command(Command { id: "c1".into(), kind: Some(fetch_logs) })).await;
@@ -223,19 +238,35 @@ async fn managed_node_follows_the_panel() {
     let mut session = panel.session().await;
     assert_eq!(session.hello().await.config_version, 1);
 
+    // Nothing can be reached through this uplink, so after the next panel
+    // restart the node has to come back over the default route.
+    let bad_uplink = Egress { interface: "does-not-exist0".into(), source_ip: String::new() };
+    session.send(panel_message::Msg::Config(TunnelConfig { version: 2, uplink: Some(bad_uplink), ..config })).await;
+    loop {
+        if let node_message::Msg::Status(status) = session.recv().await {
+            if status.config_version == 2 {
+                break;
+            }
+        }
+    }
+    drop(session);
+    panel.stop().await;
+    let mut panel = Panel::start(addr, &cert).await;
+    let mut session = panel.session().await;
+    assert_eq!(session.hello().await.config_version, 2);
+
     node.abort();
     let _ = node.await;
     drop(session);
     panel.stop().await;
-    std::fs::remove_dir_all(dir).unwrap();
 }
 
 #[tokio::test(flavor = "multi_thread")]
 async fn wrong_secret_is_rejected() {
     let mut panel = Panel::start("127.0.0.1:0".parse().unwrap(), &panel_cert()).await;
-    let dir = temp_dir();
+    let dir = TempDir::new();
     let key = panel.key(&"00".repeat(32));
-    let node = tokio::spawn(Managed::new(key, StateDir::open(&dir).unwrap(), LogBuffer::new(10)).unwrap().run());
+    let node = tokio::spawn(Managed::new(key, dir.state(), LogBuffer::new(10)).unwrap().run());
 
     tokio::time::timeout(WAIT, panel.rejected.recv()).await.expect("node never tried to connect").unwrap();
     assert!(panel.sessions.try_recv().is_err());
@@ -243,5 +274,4 @@ async fn wrong_secret_is_rejected() {
     node.abort();
     let _ = node.await;
     panel.stop().await;
-    std::fs::remove_dir_all(dir).unwrap();
 }
