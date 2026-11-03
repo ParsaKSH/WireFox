@@ -1,0 +1,26 @@
+# Setup:
+#   install -m 755 wirefox-panel wirefox-server /usr/local/bin/
+#   cp wirefox-panel.service /etc/systemd/system/ && systemctl daemon-reload
+#   systemctl enable --now wirefox-panel
+#   journalctl -u wirefox-panel | grep -i password
+#
+# The panel runs as root: it writes the core's config under /etc/wirefox, its
+# unit under /etc/systemd/system, and runs systemctl and journalctl. Stopping
+# the panel does not stop the core or the nodes.
+
+[Unit]
+Description=WireFox panel
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+ExecStart=/usr/local/bin/wirefox-panel -addr 127.0.0.1:8080
+# Set the first admin password instead of a generated one:
+#Environment=WIREFOX_PANEL_PASSWORD=change-me
+Restart=always
+RestartSec=2
+StateDirectory=wirefox-panel
+StateDirectoryMode=0700
+
+[Install]
+WantedBy=multi-user.target

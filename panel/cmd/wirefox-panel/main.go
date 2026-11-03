@@ -28,6 +28,9 @@ import (
 
 const passwordEnv = "WIREFOX_PANEL_PASSWORD"
 
+// Set at build time: go build -ldflags "-X main.version=v1.2.3".
+var version = "dev"
+
 type options struct {
 	addr          string
 	grpcAddr      string
@@ -60,7 +63,12 @@ func main() {
 	flag.BoolVar(&o.tls, "tls", false, "serve the web UI over HTTPS with the panel's own certificate")
 	flag.StringVar(&o.tlsCert, "tls-cert", "", "serve the web UI over HTTPS with this certificate (PEM)")
 	flag.StringVar(&o.tlsKey, "tls-key", "", "key for -tls-cert (PEM)")
+	showVersion := flag.Bool("version", false, "print the version and exit")
 	flag.Parse()
+	if *showVersion {
+		fmt.Println("wirefox-panel", version)
+		return
+	}
 
 	log := slog.New(slog.NewTextHandler(os.Stderr, nil))
 	slog.SetDefault(log)

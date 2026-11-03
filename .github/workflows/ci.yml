@@ -54,3 +54,51 @@ jobs:
           toolchain: "1.88"
       - uses: Swatinem/rust-cache@v2
       - run: cargo check --workspace --all-targets --locked
+
+  panel:
+    name: Panel
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: panel
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-node@v5
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: panel/frontend/package-lock.json
+      - uses: actions/setup-go@v6
+        with:
+          go-version-file: panel/go.mod
+          cache-dependency-path: panel/go.sum
+
+      - name: Frontend
+        working-directory: panel/frontend
+        run: |
+          npm ci
+          npm run typecheck
+          npm test
+          npm run build
+
+      - name: Format and vet
+        run: |
+          unformatted=$(gofmt -l .)
+          if [ -n "$unformatted" ]; then echo "$unformatted"; exit 1; fi
+          go vet ./...
+
+      - run: go test -race ./...
+
+      # The generated gRPC code is committed; make sure it matches the proto.
+      # Version comments in the header depend on the local protoc and are ignored.
+      - name: Protobuf code is up to date
+        env:
+          PROTOC_VERSION: "36.2"
+        run: |
+          curl -sSfL -o "$RUNNER_TEMP/protoc.zip" \
+            "https://github.com/protocolbuffers/protobuf/releases/download/v${PROTOC_VERSION}/protoc-${PROTOC_VERSION}-linux-x86_64.zip"
+          unzip -q "$RUNNER_TEMP/protoc.zip" -d "$RUNNER_TEMP/protoc"
+          go install google.golang.org/protobuf/cmd/protoc-gen-go@v1.36.12
+          go install google.golang.org/grpc/cmd/protoc-gen-go-grpc@v1.6.2
+          PATH="$RUNNER_TEMP/protoc/bin:$(go env GOPATH)/bin:$PATH" make proto
+          git diff --exit-code -I '^//[[:space:]]+protoc' -- internal/agentpb
