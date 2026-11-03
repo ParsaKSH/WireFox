@@ -1,0 +1,3 @@
+# Built by the frontend (make frontend); only the placeholder is committed.
+/dist/*
+!/dist/.gitkeep
