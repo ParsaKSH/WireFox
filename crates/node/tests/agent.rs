@@ -173,7 +173,11 @@ impl Drop for TempDir {
 #[tokio::test(flavor = "multi_thread")]
 async fn managed_node_follows_the_panel() {
     let logs = LogBuffer::new(1000);
-    tracing::subscriber::set_global_default(tracing_subscriber::registry().with(logs.layer())).unwrap();
+    // Filter like the binary does; unfiltered, trace output from hyper and h2
+    // can push the lines this test looks for out of the buffer.
+    let subscriber =
+        tracing_subscriber::registry().with(logs.layer()).with(tracing_subscriber::filter::LevelFilter::INFO);
+    tracing::subscriber::set_global_default(subscriber).unwrap();
 
     let cert = panel_cert();
     let mut panel = Panel::start("127.0.0.1:0".parse().unwrap(), &cert).await;

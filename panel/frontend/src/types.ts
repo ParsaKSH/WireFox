@@ -84,6 +84,11 @@ export interface NodeCore {
   remote: string;
   connected_at: number;
   traffic: Traffic;
+  /** Egress set on the WireFox server itself; the panel clears it. */
+  egress_override: Binding | null;
+  /** What the node reports using; null while offline. */
+  active_egress: Binding | null;
+  egress_error: string;
 }
 
 export interface NodeAgent {

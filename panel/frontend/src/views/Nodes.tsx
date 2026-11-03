@@ -269,6 +269,11 @@ export function Nodes() {
                   ) : (
                     <span className="text-xs text-slate-500">default</span>
                   )}
+                  {n.core.egress_error && (
+                    <p className="max-w-[12rem] truncate text-[11px] text-rose-300/80" title={n.core.egress_error}>
+                      {n.core.egress_error}
+                    </p>
+                  )}
                 </td>
                 <td className="td">
                   <div className="flex justify-end gap-0.5">
