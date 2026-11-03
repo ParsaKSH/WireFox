@@ -18,14 +18,22 @@ pub struct Supervisor {
     state: StateDir,
     monitor: Arc<Monitor>,
     applied: Option<TunnelConfig>,
-    running: Option<JoinHandle<()>>,
-    /// Why the last config from the panel was not applied.
+    /// False while `applied` still has to be written to the state directory.
+    saved: bool,
+    running: Option<Running>,
+    /// Why the last config from the panel was not applied, or not saved.
     config_error: Option<String>,
+}
+
+/// The tunnel of the applied config.
+struct Running {
+    node: Arc<Node>,
+    task: JoinHandle<()>,
 }
 
 impl Supervisor {
     pub fn new(state: StateDir) -> Self {
-        Supervisor { state, monitor: Arc::default(), applied: None, running: None, config_error: None }
+        Supervisor { state, monitor: Arc::default(), applied: None, saved: true, running: None, config_error: None }
     }
 
     pub fn state(&self) -> &StateDir {
@@ -45,9 +53,14 @@ impl Supervisor {
         self.config_error.as_deref()
     }
 
-    /// The interface used to reach the WireFox server, which the panel
-    /// connection uses as well. Falls back to the default route while there's
-    /// no usable config.
+    /// Why the running tunnel can't send traffic out, see [`Node::egress_error`].
+    pub fn egress_error(&self) -> Option<String> {
+        self.running.as_ref().and_then(|r| r.node.egress_error())
+    }
+
+    /// The interface used to reach the WireFox server. The panel connection
+    /// tries it first. Falls back to the default route while there's no usable
+    /// config.
     pub fn uplink(&self) -> EgressSpec {
         self.applied.as_ref().and_then(|c| egress_spec(c.uplink.as_ref()).ok()).unwrap_or_default()
     }
@@ -55,12 +68,12 @@ impl Supervisor {
     /// Switch to `cfg`. A config that can't be used is reported through
     /// [`config_error`](Self::config_error) and the current tunnel keeps running.
     pub async fn apply(&mut self, cfg: TunnelConfig) {
-        let unchanged = self.applied.as_ref().is_some_and(|c| c.version == cfg.version);
-        if unchanged && (self.running.is_some() || !cfg.enabled) {
-            return;
-        }
         let version = cfg.version;
-        self.config_error = match self.replace(cfg).await {
+        // Compare whole configs: a node deleted and added again in the panel
+        // may get a config with the version of the one saved here.
+        let current = self.applied.as_ref() == Some(&cfg) && (self.running.is_some() || !cfg.enabled);
+        let result = if current { Ok(()) } else { self.replace(cfg).await };
+        self.config_error = match result.and_then(|()| self.save()) {
             Ok(()) => None,
             Err(e) => {
                 warn!(version, "tunnel config not applied: {e:#}");
@@ -75,45 +88,54 @@ impl Supervisor {
         if !cfg.enabled {
             bail!("the tunnel is disabled");
         }
-        let version = cfg.version;
         let node = Node::with_monitor(node_config(cfg)?, self.monitor.clone())?;
-        self.stop().await;
-        info!(version, "restarting the tunnel");
-        self.running = Some(tokio::spawn(node.run()));
+        info!(version = cfg.version, "restarting the tunnel");
+        self.switch_to(Some(node)).await;
         Ok(())
     }
 
     async fn replace(&mut self, cfg: TunnelConfig) -> Result<()> {
         // Build the new node first, so a bad config leaves the old tunnel alone.
         let node = if cfg.enabled { Some(Node::with_monitor(node_config(&cfg)?, self.monitor.clone())?) } else { None };
-        self.stop().await;
         match node {
-            Some(node) => {
-                info!(version = cfg.version, server = %cfg.server, "starting the tunnel");
-                self.running = Some(tokio::spawn(node.run()));
-            }
+            Some(_) => info!(version = cfg.version, server = %cfg.server, "starting the tunnel"),
             None => info!(version = cfg.version, "the tunnel is disabled"),
         }
-        let saved = self.state.save_tunnel(&cfg);
+        self.switch_to(node).await;
         self.applied = Some(cfg);
-        saved
+        self.saved = false;
+        Ok(())
     }
 
-    /// Streams the old node is relaying run in their own tasks and survive this.
-    async fn stop(&mut self) {
-        if let Some(task) = self.running.take() {
-            task.abort();
+    /// Write the applied config to the state directory, unless it is there
+    /// already. A failed write is retried with the next config push.
+    fn save(&mut self) -> Result<()> {
+        if !self.saved {
+            if let Some(cfg) = &self.applied {
+                self.state.save_tunnel(cfg)?;
+            }
+            self.saved = true;
+        }
+        Ok(())
+    }
+
+    /// Stop the running tunnel and start `node`, if any, in its place. Streams
+    /// the old node is relaying run in their own tasks and survive this.
+    async fn switch_to(&mut self, node: Option<Arc<Node>>) {
+        if let Some(old) = self.running.take() {
+            old.task.abort();
             // Wait until it is gone, so it can't report state over the next node.
-            let _ = task.await;
+            let _ = old.task.await;
             self.monitor.set_stopped();
         }
+        self.running = node.map(|node| Running { task: tokio::spawn(node.clone().run()), node });
     }
 }
 
 impl Drop for Supervisor {
     fn drop(&mut self) {
-        if let Some(task) = &self.running {
-            task.abort();
+        if let Some(running) = &self.running {
+            running.task.abort();
         }
     }
 }
@@ -154,6 +176,8 @@ fn egress_spec(egress: Option<&Egress>) -> Result<EgressSpec> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::managed::state::TempDir;
+    use crate::tunnel::TunnelState;
 
     fn config() -> TunnelConfig {
         TunnelConfig {
@@ -170,6 +194,11 @@ mod tests {
             uplink: Some(Egress { interface: String::new(), source_ip: String::new() }),
             ..Default::default()
         }
+    }
+
+    /// A config whose tunnel just keeps retrying: nothing listens on port 1.
+    fn unreachable() -> TunnelConfig {
+        TunnelConfig { server: "127.0.0.1:1".into(), egress: None, ..config() }
     }
 
     #[test]
@@ -210,11 +239,10 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn applies_configs_by_version() {
-        let dir = std::env::temp_dir().join(format!("wirefox-supervisor-{}", wirefox_common::random_token(8)));
-        let mut sup = Supervisor::new(StateDir::open(&dir).unwrap());
-        // Nothing listens on port 1, so the tunnel just keeps retrying.
-        let cfg = TunnelConfig { server: "127.0.0.1:1".into(), ..config() };
+    async fn applies_new_configs() {
+        let dir = TempDir::new("supervisor");
+        let mut sup = Supervisor::new(StateDir::open(dir.path()).unwrap());
+        let cfg = unreachable();
         sup.apply(cfg.clone()).await;
         assert_eq!(sup.config_version(), 3);
         assert!(sup.config_error().is_none());
@@ -227,14 +255,53 @@ mod tests {
         assert_eq!(sup.config_version(), 3);
         assert!(sup.running.is_some());
 
+        // Same version, other content: the config of a node created anew.
+        let recreated = TunnelConfig { node_id: "n2".into(), token: "t2".into(), ..cfg.clone() };
+        sup.apply(recreated.clone()).await;
+        assert!(sup.config_error().is_none());
+        assert_eq!(sup.applied, Some(recreated.clone()));
+        assert_eq!(sup.state().load_tunnel().unwrap(), Some(recreated));
+
         sup.apply(TunnelConfig { version: 5, enabled: false, ..cfg.clone() }).await;
         assert!(sup.config_error().is_none());
         assert!(sup.running.is_none());
-        assert_eq!(sup.monitor().status().state, crate::tunnel::TunnelState::Stopped);
+        assert_eq!(sup.monitor().status().state, TunnelState::Stopped);
         assert!(sup.restart().await.is_err());
         assert_eq!(sup.state().load_tunnel().unwrap().unwrap().version, 5);
+    }
 
-        drop(sup);
-        std::fs::remove_dir_all(dir).unwrap();
+    #[tokio::test]
+    async fn retries_a_failed_save() {
+        let dir = TempDir::new("supervisor");
+        let mut sup = Supervisor::new(StateDir::open(dir.path()).unwrap());
+        // A file where the directory was makes every write fail, even as root.
+        std::fs::remove_dir(dir.path()).unwrap();
+        std::fs::write(dir.path(), "").unwrap();
+        let cfg = unreachable();
+        sup.apply(cfg.clone()).await;
+        assert!(sup.config_error().unwrap().contains("writing"), "{:?}", sup.config_error());
+        assert!(sup.running.is_some());
+        assert_eq!(sup.config_version(), 3);
+
+        // The panel sends the config again when the node reconnects.
+        std::fs::remove_file(dir.path()).unwrap();
+        std::fs::create_dir(dir.path()).unwrap();
+        sup.apply(cfg.clone()).await;
+        assert!(sup.config_error().is_none());
+        assert_eq!(sup.state().load_tunnel().unwrap(), Some(cfg));
+    }
+
+    #[tokio::test]
+    async fn reports_an_unusable_egress() {
+        let dir = TempDir::new("supervisor");
+        let mut sup = Supervisor::new(StateDir::open(dir.path()).unwrap());
+        sup.apply(unreachable()).await;
+        assert_eq!(sup.egress_error(), None);
+
+        let missing = Egress { interface: "does-not-exist0".into(), source_ip: String::new() };
+        sup.apply(TunnelConfig { version: 4, egress: Some(missing), ..unreachable() }).await;
+        assert!(sup.config_error().is_none());
+        let error = sup.egress_error().unwrap();
+        assert!(error.starts_with("egress: ") && error.contains("does-not-exist0"), "{error}");
     }
 }

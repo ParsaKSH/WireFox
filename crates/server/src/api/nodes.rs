@@ -82,7 +82,7 @@ pub struct CreateNode {
 pub async fn create(State(st): State<Arc<ApiState>>, Json(body): Json<CreateNode>) -> ApiResult<serde_json::Value> {
     let id = body.id.unwrap_or_else(|| format!("node-{}", wirefox_common::random_token(4)));
     if !valid_id(&id) {
-        return Err(error(StatusCode::BAD_REQUEST, "id must be 1-64 characters of [A-Za-z0-9._-]"));
+        return Err(error(StatusCode::BAD_REQUEST, "id must be 1-64 characters of [A-Za-z0-9._-], and not only dots"));
     }
     let token = wirefox_common::random_token(32);
     let cfg = NodeCfg {

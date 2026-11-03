@@ -304,6 +304,18 @@ impl EgressSpec {
     }
 }
 
+/// For logs: "default", "interface eth1", "source 10.0.0.2" or both.
+impl fmt::Display for EgressSpec {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match (&self.interface, self.source_ip) {
+            (None, None) => f.write_str("default"),
+            (Some(interface), None) => write!(f, "interface {interface}"),
+            (None, Some(ip)) => write!(f, "source {ip}"),
+            (Some(interface), Some(ip)) => write!(f, "interface {interface}, source {ip}"),
+        }
+    }
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct InterfaceInfo {
     pub name: String,
@@ -397,6 +409,18 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn egress_display() {
+        let spec = |interface: Option<&str>, ip: Option<&str>| EgressSpec {
+            interface: interface.map(Into::into),
+            source_ip: ip.map(|ip| ip.parse().unwrap()),
+        };
+        assert_eq!(spec(None, None).to_string(), "default");
+        assert_eq!(spec(Some("eth1"), None).to_string(), "interface eth1");
+        assert_eq!(spec(None, Some("10.0.0.2")).to_string(), "source 10.0.0.2");
+        assert_eq!(spec(Some("eth1"), Some("10.0.0.2")).to_string(), "interface eth1, source 10.0.0.2");
+    }
 
     #[tokio::test]
     async fn target_roundtrip() {

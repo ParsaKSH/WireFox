@@ -178,6 +178,13 @@ impl Node {
         &self.monitor
     }
 
+    /// Why proxied traffic can't leave right now, if it can't: the egress
+    /// interface is missing, or the source address isn't on it. The tunnel
+    /// itself may well be up meanwhile.
+    pub fn egress_error(&self) -> Option<String> {
+        self.egress.error().map(|e| format!("egress: {e}"))
+    }
+
     /// Stay connected to the server forever, reconnecting with backoff.
     pub async fn run(self: Arc<Self>) {
         self.monitor.set(TunnelState::Connecting, None);
@@ -290,15 +297,15 @@ impl Node {
             let reply = match msg {
                 ServerMsg::Ping { seq } => Some(NodeMsg::Pong { seq }),
                 ServerMsg::Demand { count } => {
-                    self.spawn_extra(count.min(MAX_DEMAND_PER_MSG));
+                    self.spawn_extra(count.min(MAX_DEMAND_PER_MSG), cancel);
                     None
                 }
                 ServerMsg::SetEgress { egress } => {
                     let error = self.egress.set_override(egress);
                     let egress = self.egress.effective();
                     match &error {
-                        None => info!(?egress, "egress set by server"),
-                        Some(e) => warn!(?egress, error = %e, "egress set by server is not usable yet"),
+                        None => info!(%egress, "egress set by server"),
+                        Some(e) => warn!(%egress, error = %e, "egress set by server is not usable yet"),
                     }
                     Some(NodeMsg::EgressApplied { egress, error })
                 }
@@ -348,22 +355,33 @@ impl Node {
         }
     }
 
-    fn spawn_extra(self: &Arc<Self>, count: u32) {
+    /// Open up to `count` more data connections for a burst. Like the pool
+    /// slots they end with the session (and so with the node), unless they
+    /// already carry a stream: a node that was replaced must not pick up
+    /// streams for its successor.
+    fn spawn_extra(self: &Arc<Self>, count: u32, cancel: &CancellationToken) {
         for _ in 0..count {
             let Ok(permit) = self.extra.clone().try_acquire_owned() else {
                 debug!("max_extra reached, ignoring the rest of the demand");
                 return;
             };
-            let node = self.clone();
+            let (node, cancel) = (self.clone(), cancel.clone());
             tokio::spawn(async move {
-                let mut conn = match node.open_data().await {
+                let conn = tokio::select! {
+                    _ = cancel.cancelled() => return,
+                    r = node.open_data() => r,
+                };
+                let mut conn = match conn {
                     Ok(c) => c,
                     Err(e) => return debug!("extra data connection failed: {e:#}"),
                 };
-                let request = tokio::time::timeout(EXTRA_IDLE_TIMEOUT, proto::read_connect(&mut conn)).await;
+                let request = tokio::select! {
+                    _ = cancel.cancelled() => None,
+                    r = tokio::time::timeout(EXTRA_IDLE_TIMEOUT, proto::read_connect(&mut conn)) => r.ok(),
+                };
                 drop(permit);
                 match request {
-                    Ok(Ok(target)) => node.serve(conn, target).await,
+                    Some(Ok(target)) => node.serve(conn, target).await,
                     // Close properly so the server drops it from its pool right away.
                     _ => {
                         let _ = conn.shutdown().await;

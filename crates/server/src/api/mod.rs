@@ -135,8 +135,12 @@ fn default_true() -> bool {
     true
 }
 
+/// Ids end up in URL paths, where "." and ".." are dot segments that clients
+/// resolve away, so ids made only of dots could never be addressed.
 fn valid_id(s: &str) -> bool {
-    !s.is_empty() && s.len() <= 64 && s.chars().all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.'))
+    s.len() <= 64
+        && s.chars().all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.'))
+        && s.chars().any(|c| c != '.')
 }
 
 fn bearer(headers: &HeaderMap) -> Option<&str> {
@@ -311,6 +315,10 @@ mod tests {
         assert!(!valid_id(""));
         assert!(!valid_id("has space"));
         assert!(!valid_id("../etc"));
+        assert!(valid_id(".hidden"));
+        for dots in [".", "..", "..."] {
+            assert!(!valid_id(dots), "{dots}");
+        }
         assert!(!valid_id(&"x".repeat(65)));
     }
 

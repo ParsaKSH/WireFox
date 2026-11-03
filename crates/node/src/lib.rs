@@ -16,4 +16,4 @@ pub mod pb {
 }
 
 pub use config::NodeConfig;
-pub use tunnel::{Monitor, Node, TunnelState, TunnelStatus};
+pub use tunnel::Node;
