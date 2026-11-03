@@ -6,8 +6,9 @@ WireFox server (the core) and lets you manage everything from a browser:
 - **The core**: its configuration, its systemd service (start, stop, restart)
   and its logs. Load balancing and timeouts change live; listener changes
   need a restart, which the panel tells you about.
-- **Exit-nodes**: create a node, copy its key, run `wirefox-node run --key <KEY>`
-  on the node and you're done. The node keeps a gRPC connection open to the
+- **Exit-nodes**: create a node, put its key in the node's environment
+  (`WIREFOX_NODE_KEY`), run `wirefox-node run` and you're done. The node keeps
+  a gRPC connection open to the
   panel; the panel pushes its tunnel settings (pool size, egress interface,
   ...) and can restart its tunnel, list its interfaces and fetch its logs.
 - **SOCKS users**, live **connections**, traffic and an activity log.
@@ -56,10 +57,31 @@ WIREFOX_PANEL_PASSWORD='new password' wirefox-panel -reset-password
 systemctl start wirefox-panel
 ```
 
-The web UI listens on `:8080` over plain HTTP by default. Either put it behind a
-reverse proxy with TLS, keep it on `127.0.0.1` and reach it through an SSH
-tunnel, or start the panel with `-tls` (its own self-signed certificate) or
-`-tls-cert`/`-tls-key`.
+The web UI listens on `127.0.0.1:8080` over plain HTTP by default, so only this
+machine reaches it. Pick one way to reach it from elsewhere:
+
+- an SSH tunnel (`ssh -L 8080:127.0.0.1:8080 server`), then open
+  `http://127.0.0.1:8080`. Set the agent address in **Settings** before adding
+  nodes, since the panel can't derive it from `127.0.0.1`;
+- `-tls` (the panel's own self-signed certificate) or `-tls-cert`/`-tls-key`,
+  together with `-addr :8080`;
+- a reverse proxy with TLS in front of `127.0.0.1:8080`. Start the panel with
+  `-trusted-proxies 127.0.0.1/32` (the proxy's address) so it takes the client
+  address, host and scheme from the proxy's headers; without that, every
+  login looks like it came from the proxy and shares one rate limit. For
+  nginx:
+
+  ```nginx
+  location / {
+      proxy_pass http://127.0.0.1:8080;
+      proxy_set_header Host $host;
+      proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+      proxy_set_header X-Forwarded-Proto $scheme;
+  }
+  ```
+
+The panel logs a warning when it serves plain HTTP on anything but a loopback
+address: passwords, sessions and node keys would cross the network in clear.
 
 Ports to open on the server: the panel's agent port (`50051`) for nodes, the
 tunnel port (`7443`) for nodes, and the SOCKS ports (`1080`, `1443`) for users.
@@ -72,21 +94,27 @@ tunnel port (`7443`) for nodes, and the SOCKS ports (`1080`, `1443`) for users.
    a different name than the server's listen address.
 3. In **Nodes**, click *Add node*. The key is shown once, with ready-made setup
    steps for Linux (systemd), Windows and OpenWrt.
-4. On the node: `wirefox-node run --key '<KEY>'` (or put the key in
-   `WIREFOX_NODE_KEY`; see `examples/wirefox-node-managed.service`).
+4. On the node, give `wirefox-node run` the key in `WIREFOX_NODE_KEY`, never on
+   its command line, where other users could read it. On Linux that's
+   `/etc/wirefox/node.env` (mode 600) with `WIREFOX_NODE_KEY=<KEY>`, loaded by
+   `examples/wirefox-node-managed.service`.
 
 The node saves the settings it receives under `/var/lib/wirefox-node`
-(`%ProgramData%\wirefox-node` on Windows), so it brings its tunnel up right
-away after a reboot, even while the panel is unreachable.
+(`%ProgramData%\wirefox-node` on Windows, `/etc/wirefox-node` in the OpenWrt
+steps), so it brings its tunnel up right away after a reboot, even while the
+panel is unreachable.
 
-A leaked key can be replaced from the node's menu (*New key*); the old one
-stops working immediately.
+A leaked key can be replaced from the node's menu (*New key*). That revokes the
+old key and the node's tunnel token, which the old key gave access to, and
+drops the agent connected with it. The node's tunnel stays down until it runs
+with the new key.
 
 ## Flags
 
 | Flag | Default | |
 |---|---|---|
-| `-addr` | `:8080` | Web UI listen address |
+| `-addr` | `127.0.0.1:8080` | Web UI listen address |
+| `-trusted-proxies` | | Comma-separated CIDRs of reverse proxies whose `X-Forwarded-For`, `X-Forwarded-Host` and `X-Forwarded-Proto` are believed |
 | `-grpc-addr` | `:50051` | Listen address for node connections |
 | `-data` | `/var/lib/wirefox-panel` | Panel database and certificate |
 | `-core-mode` | `systemd` | `systemd`: the panel runs the core as a systemd service. `external`: the panel only writes the core's config; you run the core yourself |

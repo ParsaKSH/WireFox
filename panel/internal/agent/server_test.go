@@ -92,6 +92,15 @@ func (e *testEnv) addNode(t *testing.T, id string) string {
 	return secret
 }
 
+func (e *testEnv) version(t *testing.T, id string) uint64 {
+	t.Helper()
+	n, err := e.st.Node(context.Background(), id)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return n.ConfigVersion
+}
+
 // dial opens a Connect stream the way wirefox-node does: TLS 1.3, pinned
 // fingerprint, SNI "wirefox-panel", secret in the metadata.
 func (e *testEnv) dial(t *testing.T, secret string) agentpb.Agent_ConnectClient {
@@ -224,7 +233,7 @@ func TestHelloGetsWelcomeAndConfig(t *testing.T) {
 		t.Fatalf("welcome: %v", welcome)
 	}
 	cfg := mustRecv(t, stream).GetConfig()
-	if cfg.GetVersion() != 1 || !cfg.GetEnabled() || cfg.GetServer() != "relay.example.com:7443" ||
+	if cfg.GetVersion() != e.version(t, "office-1") || !cfg.GetEnabled() || cfg.GetServer() != "relay.example.com:7443" ||
 		cfg.GetServerName() != "wirefox" || cfg.GetServerFingerprint() != "aa" || cfg.GetNodeId() != "office-1" ||
 		cfg.GetToken() != "token-office-1" || cfg.GetPoolSize() != store.DefaultPoolSize ||
 		cfg.GetMaxExtra() != store.DefaultMaxExtra || cfg.GetConnectTimeoutSecs() != store.DefaultConnectTimeoutSecs ||
@@ -242,14 +251,16 @@ func TestHelloGetsWelcomeAndConfig(t *testing.T) {
 	}
 
 	err = stream.Send(&agentpb.NodeMessage{Msg: &agentpb.NodeMessage_Status{Status: &agentpb.Status{
-		ConfigVersion: 1, TunnelState: agentpb.TunnelState_TUNNEL_STATE_CONNECTED, ActiveStreams: 3,
+		ConfigVersion: cfg.GetVersion(), TunnelState: agentpb.TunnelState_TUNNEL_STATE_CONNECTED,
+		ConnectedSecs: 42, ActiveStreams: 3,
 	}}})
 	if err != nil {
 		t.Fatal(err)
 	}
 	waitFor(t, "status", func() bool {
 		live := e.srv.Live("office-1")
-		return live != nil && live.Info.TunnelState == "connected" && live.Info.ActiveStreams == 3
+		return live != nil && live.Info.TunnelState == "connected" && live.Info.ActiveStreams == 3 &&
+			live.Info.ConnectedSecs == 42
 	})
 
 	stream.CloseSend()
@@ -263,7 +274,7 @@ func TestHelloGetsWelcomeAndConfig(t *testing.T) {
 func TestPushConfig(t *testing.T) {
 	e := newTestEnv(t)
 	secret := e.addNode(t, "office-1")
-	stream, _ := connect(t, e, secret)
+	stream, first := connect(t, e, secret)
 
 	_, err := e.st.UpdateNode(context.Background(), "office-1", func(n *store.Node) error {
 		n.PoolSize = 32
@@ -275,7 +286,7 @@ func TestPushConfig(t *testing.T) {
 	}
 	e.srv.PushConfig("office-1")
 	cfg := mustRecv(t, stream).GetConfig()
-	if cfg.GetVersion() != 2 || cfg.GetPoolSize() != 32 {
+	if cfg.GetVersion() != first.GetVersion()+1 || cfg.GetPoolSize() != 32 {
 		t.Fatalf("pushed config: %v", cfg)
 	}
 }
@@ -283,29 +294,30 @@ func TestPushConfig(t *testing.T) {
 func TestSyncEndpointPushesEveryNode(t *testing.T) {
 	e := newTestEnv(t)
 	secret := e.addNode(t, "office-1")
-	stream, _ := connect(t, e, secret)
+	stream, first := connect(t, e, secret)
 	ctx := context.Background()
 
 	if err := e.srv.SyncEndpoint(ctx); err != nil {
 		t.Fatal(err)
 	}
 	// The first sync only records the endpoint the node already has.
-	if n, _ := e.st.Node(ctx, "office-1"); n.ConfigVersion != 1 {
-		t.Fatalf("first sync bumped the version to %d", n.ConfigVersion)
+	if v := e.version(t, "office-1"); v != first.GetVersion() {
+		t.Fatalf("first sync bumped the version to %d", v)
 	}
 	e.setEndpoint(Endpoint{Server: "relay.example.com:8443", Fingerprint: "bb"})
 	if err := e.srv.SyncEndpoint(ctx); err != nil {
 		t.Fatal(err)
 	}
 	cfg := mustRecv(t, stream).GetConfig()
-	if cfg.GetVersion() != 2 || cfg.GetServer() != "relay.example.com:8443" || cfg.GetServerFingerprint() != "bb" {
+	if cfg.GetVersion() != first.GetVersion()+1 || cfg.GetServer() != "relay.example.com:8443" ||
+		cfg.GetServerFingerprint() != "bb" {
 		t.Fatalf("config after endpoint change: %v", cfg)
 	}
 	if err := e.srv.SyncEndpoint(ctx); err != nil {
 		t.Fatal(err)
 	}
-	if n, _ := e.st.Node(ctx, "office-1"); n.ConfigVersion != 2 {
-		t.Fatalf("unchanged endpoint bumped the version to %d", n.ConfigVersion)
+	if v := e.version(t, "office-1"); v != cfg.GetVersion() {
+		t.Fatalf("unchanged endpoint bumped the version to %d", v)
 	}
 }
 
@@ -317,6 +329,11 @@ func TestTunnelConfigNeedsEndpoint(t *testing.T) {
 		{Server: "relay.example.com:7443"},
 		{Server: "0.0.0.0:7443", Fingerprint: "aa"},
 		{Server: "[::]:7443", Fingerprint: "aa"},
+		{Server: "127.0.0.1:7443", Fingerprint: "aa"},
+		{Server: "[::1]:7443", Fingerprint: "aa"},
+		{Server: "localhost:7443", Fingerprint: "aa"},
+		{Server: "[fe80::1%eth0]:7443", Fingerprint: "aa"},
+		{Server: "relay.example.com", Fingerprint: "aa"},
 	} {
 		e.setEndpoint(ep)
 		if _, err := e.srv.TunnelConfig(context.Background(), n); err == nil {
@@ -458,6 +475,29 @@ func TestDisconnectRevokes(t *testing.T) {
 	e.srv.Disconnect("office-1")
 	if _, err := recv(t, stream); status.Code(err) != codes.Unauthenticated {
 		t.Fatalf("got %v", err)
+	}
+}
+
+func TestKeyReplacedBeforeHello(t *testing.T) {
+	e := newTestEnv(t)
+	stream := e.dial(t, e.addNode(t, "office-1"))
+	// Let the panel accept the key, then replace it while it waits for Hello.
+	time.Sleep(testInterval)
+	_, err := e.st.UpdateNode(context.Background(), "office-1", func(n *store.Node) error {
+		n.AgentKeyHash = keys.Hash(keys.NewSecret())
+		n.Token = "rotated"
+		return nil
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	e.srv.Disconnect("office-1")
+	sendHello(t, stream)
+	if msg, err := recv(t, stream); status.Code(err) != codes.Unauthenticated {
+		t.Fatalf("got %v, %v", msg, err)
+	}
+	if e.srv.Connected() != 0 {
+		t.Fatal("the revoked stream stayed registered")
 	}
 }
 

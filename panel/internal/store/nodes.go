@@ -5,7 +5,9 @@ import (
 	"database/sql"
 	"encoding/json"
 	"errors"
+	"strconv"
 	"strings"
+	"time"
 )
 
 // Defaults for new nodes; the same as wirefox-node's own.
@@ -40,6 +42,7 @@ type AgentInfo struct {
 	LastError     string      `json:"last_error"`
 	ConfigVersion uint64      `json:"config_version"`
 	UptimeSecs    uint64      `json:"uptime_secs"`
+	ConnectedSecs uint64      `json:"connected_secs"`
 	ActiveStreams uint64      `json:"active_streams"`
 	TotalStreams  uint64      `json:"total_streams"`
 	Interfaces    []Interface `json:"interfaces"`
@@ -67,6 +70,7 @@ type Node struct {
 	Egress             Egress
 	Uplink             Egress
 	// Bumped whenever anything that goes into the node's TunnelConfig changes.
+	// CreateNode sets the first one.
 	ConfigVersion uint64
 
 	// Nil until the node's agent first connects.
@@ -83,7 +87,6 @@ func NewNode(id string) *Node {
 		PoolSize:           DefaultPoolSize,
 		MaxExtra:           DefaultMaxExtra,
 		ConnectTimeoutSecs: DefaultConnectTimeoutSecs,
-		ConfigVersion:      1,
 	}
 }
 
@@ -118,15 +121,70 @@ func scanNode(row scanner) (*Node, error) {
 	return &n, nil
 }
 
+// CreateNode stores a new node and sets its first config version. That
+// version is above any the panel handed out before, also to deleted nodes or
+// from an earlier database: a node still running an old config must not
+// mistake the new one for it.
 func (s *Store) CreateNode(ctx context.Context, n *Node) error {
-	_, err := s.db.ExecContext(ctx, `INSERT INTO nodes (`+nodeColumns+`)
-		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, 0)`,
-		n.ID, n.Name, n.Enabled, n.CreatedAt, n.Token, n.AgentKeyHash, n.KeyCreatedAt,
-		n.PoolSize, n.MaxExtra, n.ConnectTimeoutSecs, n.AllowLocal,
-		n.Egress.Interface, n.Egress.SourceIP, n.Uplink.Interface, n.Uplink.SourceIP, n.ConfigVersion)
-	if err != nil && strings.Contains(err.Error(), "UNIQUE constraint failed") {
-		return ErrExists
+	return s.tx(ctx, func(tx *sql.Tx) error {
+		version, err := nextConfigVersion(ctx, tx)
+		if err != nil {
+			return err
+		}
+		_, err = tx.ExecContext(ctx, `INSERT INTO nodes (`+nodeColumns+`)
+			VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, 0)`,
+			n.ID, n.Name, n.Enabled, n.CreatedAt, n.Token, n.AgentKeyHash, n.KeyCreatedAt,
+			n.PoolSize, n.MaxExtra, n.ConnectTimeoutSecs, n.AllowLocal,
+			n.Egress.Interface, n.Egress.SourceIP, n.Uplink.Interface, n.Uplink.SourceIP, version)
+		if err != nil && strings.Contains(err.Error(), "UNIQUE constraint failed") {
+			return ErrExists
+		}
+		if err != nil {
+			return err
+		}
+		n.ConfigVersion = version
+		return nil
+	})
+}
+
+// nextConfigVersion returns a version above every node's current one and
+// every one recorded before, and records it. Starting from the clock in
+// milliseconds keeps versions growing across rebuilt databases too.
+func nextConfigVersion(ctx context.Context, tx *sql.Tx) (uint64, error) {
+	var highest uint64
+	err := tx.QueryRowContext(ctx, "SELECT COALESCE(MAX(config_version), 0) FROM nodes").Scan(&highest)
+	if err != nil {
+		return 0, err
 	}
+	recorded, err := lastConfigVersion(ctx, tx)
+	if err != nil {
+		return 0, err
+	}
+	version := max(highest+1, recorded+1, uint64(time.Now().UnixMilli()))
+	return version, recordConfigVersion(ctx, tx, version)
+}
+
+func lastConfigVersion(ctx context.Context, tx *sql.Tx) (uint64, error) {
+	var v string
+	err := tx.QueryRowContext(ctx, "SELECT v FROM settings WHERE k = ?", settingLastConfigVersion).Scan(&v)
+	if errors.Is(err, sql.ErrNoRows) {
+		return 0, nil
+	}
+	if err != nil {
+		return 0, err
+	}
+	return strconv.ParseUint(v, 10, 64)
+}
+
+// recordConfigVersion raises the recorded version to version.
+func recordConfigVersion(ctx context.Context, tx *sql.Tx, version uint64) error {
+	recorded, err := lastConfigVersion(ctx, tx)
+	if err != nil || recorded >= version {
+		return err
+	}
+	_, err = tx.ExecContext(ctx,
+		"INSERT INTO settings (k, v) VALUES (?, ?) ON CONFLICT (k) DO UPDATE SET v = excluded.v",
+		settingLastConfigVersion, strconv.FormatUint(version, 10))
 	return err
 }
 
@@ -202,14 +260,18 @@ func (s *Store) BumpAllVersions(ctx context.Context) error {
 	return err
 }
 
+// DeleteNode removes a node. Its config version stays recorded, so a node
+// created later under the same id starts above it.
 func (s *Store) DeleteNode(ctx context.Context, id string) error {
-	res, err := s.db.ExecContext(ctx, "DELETE FROM nodes WHERE id = ?", id)
-	if err != nil {
-		return err
-	}
-	n, err := res.RowsAffected()
-	if err == nil && n == 0 {
-		return ErrNotFound
-	}
-	return err
+	return s.tx(ctx, func(tx *sql.Tx) error {
+		var version uint64
+		err := tx.QueryRowContext(ctx, "DELETE FROM nodes WHERE id = ? RETURNING config_version", id).Scan(&version)
+		if errors.Is(err, sql.ErrNoRows) {
+			return ErrNotFound
+		}
+		if err != nil {
+			return err
+		}
+		return recordConfigVersion(ctx, tx, version)
+	})
 }

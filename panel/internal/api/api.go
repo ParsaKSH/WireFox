@@ -8,10 +8,10 @@ import (
 	"io"
 	"log/slog"
 	"mime"
-	"net"
 	"net/http"
 	"net/url"
 	"strconv"
+	"strings"
 	"time"
 
 	"github.com/ParsaKSH/WireFox/panel/internal/agent"
@@ -20,15 +20,26 @@ import (
 	"github.com/ParsaKSH/WireFox/panel/internal/store"
 )
 
-const maxBodySize = 1 << 20
+const (
+	maxBodySize = 1 << 20
 
-// Options configure the API. Everything except Logger is required.
+	// The lines parameter of the log endpoints.
+	defaultLogLines = 200
+	maxLogLines     = 5000
+
+	// How long calls that only add detail to an answer may take.
+	quickTimeout = 3 * time.Second
+)
+
+// Options configure the API. Everything except Logger and TrustedProxies is
+// required.
 type Options struct {
 	Store   *store.Store
 	Core    *core.Client
 	Manager core.Manager
 	Agents  *agent.Server
 	Sampler *core.Sampler
+	Tunnel  *core.RunningTunnel
 	Cert    *keys.Cert
 	// The core's config file and binary, as shown in GET /api/core.
 	CoreConfigPath string
@@ -36,20 +47,27 @@ type Options struct {
 	// Port of the gRPC listener, used in node keys while agent_public_addr
 	// isn't set.
 	GRPCPort string
-	// Marks the session cookie Secure; set when the UI is served over HTTPS.
-	SecureCookies bool
-	Logger        *slog.Logger
+	// Reverse proxies whose X-Forwarded-* headers are believed.
+	TrustedProxies Proxies
+	Logger         *slog.Logger
 }
 
 type API struct {
 	Options
 	log    *slog.Logger
 	logins *failureLimiter
+	// Bounds the bcrypt comparisons running at once.
+	bcryptSlots chan struct{}
 }
 
 // New returns the handler for everything under /api/.
 func New(opts Options) http.Handler {
-	a := &API{Options: opts, log: opts.Logger, logins: newFailureLimiter(10, 5*time.Minute)}
+	a := &API{
+		Options:     opts,
+		log:         opts.Logger,
+		logins:      newFailureLimiter(maxLoginFailures, loginFailureWindow),
+		bcryptSlots: make(chan struct{}, maxConcurrentLogins),
+	}
 	if a.log == nil {
 		a.log = slog.Default()
 	}
@@ -78,7 +96,7 @@ func New(opts Options) http.Handler {
 	auth("POST /api/nodes/{id}/reset-traffic", a.resetNodeTraffic)
 
 	auth("GET /api/users", a.proxy)
-	auth("POST /api/users", a.proxy)
+	auth("POST /api/users", a.createUser)
 	auth("PATCH /api/users/{name}", a.proxy)
 	auth("DELETE /api/users/{name}", a.proxy)
 	auth("POST /api/users/{name}/reset-traffic", a.proxy)
@@ -90,7 +108,7 @@ func New(opts Options) http.Handler {
 	auth("PUT /api/core/config", a.putCoreConfig)
 	auth("POST /api/core/start", a.coreAction(core.Manager.Start, "started"))
 	auth("POST /api/core/stop", a.coreAction(core.Manager.Stop, "stopped"))
-	auth("POST /api/core/restart", a.coreAction(core.Manager.Restart, "restarted"))
+	auth("POST /api/core/restart", a.coreAction(a.restartCore, "restarted"))
 	auth("GET /api/core/logs", a.coreLogs)
 
 	auth("GET /api/settings", a.getSettings)
@@ -101,13 +119,13 @@ func New(opts Options) http.Handler {
 	mux.HandleFunc("/api/", func(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusNotFound, "no such endpoint")
 	})
-	return sameOriginJSON(mux)
+	return a.sameOriginJSON(mux)
 }
 
 // sameOriginJSON turns away state-changing requests a browser could send from
 // another site: a body must be JSON (forms can't send that without CORS), and
 // an Origin header, when present, must be our own.
-func sameOriginJSON(next http.Handler) http.Handler {
+func (a *API) sameOriginJSON(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		switch r.Method {
 		case http.MethodGet, http.MethodHead, http.MethodOptions:
@@ -116,7 +134,7 @@ func sameOriginJSON(next http.Handler) http.Handler {
 		}
 		if origin := r.Header.Get("Origin"); origin != "" {
 			u, err := url.Parse(origin)
-			if err != nil || u.Host != r.Host {
+			if err != nil || u.Host != a.TrustedProxies.host(r) {
 				writeError(w, http.StatusForbidden, "cross-origin request refused")
 				return
 			}
@@ -147,10 +165,20 @@ func SecurityHeaders(next http.Handler) http.Handler {
 }
 
 func writeJSON(w http.ResponseWriter, status int, v any) {
+	jsonHeaders(w, status)
+	_ = json.NewEncoder(w).Encode(v)
+}
+
+// writeRaw answers with a body that already is JSON.
+func writeRaw(w http.ResponseWriter, status int, data []byte) {
+	jsonHeaders(w, status)
+	_, _ = w.Write(data)
+}
+
+func jsonHeaders(w http.ResponseWriter, status int) {
 	w.Header().Set("Content-Type", "application/json")
 	w.Header().Set("Cache-Control", "no-store")
 	w.WriteHeader(status)
-	_ = json.NewEncoder(w).Encode(v)
 }
 
 func writeError(w http.ResponseWriter, status int, msg string) {
@@ -171,16 +199,15 @@ func (a *API) internalError(w http.ResponseWriter, r *http.Request, err error) {
 // their status, an unreachable core is a 502.
 func (a *API) coreError(w http.ResponseWriter, err error) {
 	var apiErr *core.APIError
-	if errors.As(err, &apiErr) {
-		status := apiErr.Status
-		if status == http.StatusUnauthorized {
-			// Our key, not the user's session: don't log the user out.
-			status = http.StatusBadGateway
-		}
-		writeError(w, status, apiErr.Message)
-		return
+	switch {
+	case errors.As(err, &apiErr) && apiErr.Status == http.StatusUnauthorized:
+		// Our key, not the user's session: don't log the user out.
+		writeError(w, http.StatusBadGateway, "the WireFox server rejected the panel's API key")
+	case errors.As(err, &apiErr):
+		writeError(w, apiErr.Status, apiErr.Message)
+	default:
+		writeError(w, http.StatusBadGateway, err.Error())
 	}
-	writeError(w, http.StatusBadGateway, err.Error())
 }
 
 // decode reads a JSON body into v, refusing unknown fields.
@@ -207,18 +234,14 @@ func queryInt(r *http.Request, name string, def, max int) int {
 	return min(n, max)
 }
 
-// clientIP is the address the request came from; the panel is not meant to
-// sit behind a proxy, so forwarding headers are not trusted.
-func clientIP(r *http.Request) string {
-	host, _, err := net.SplitHostPort(r.RemoteAddr)
-	if err != nil {
-		return r.RemoteAddr
-	}
-	return host
+// onlyDots reports whether id is made of dots only. Browsers resolve "." and
+// ".." in URL paths, so such a node or user could never be addressed.
+func onlyDots(id string) bool {
+	return id != "" && strings.Trim(id, ".") == ""
 }
 
 // quick bounds calls that only add detail to an answer, so a hanging core
 // doesn't hold up the page.
 func quick(ctx context.Context) (context.Context, context.CancelFunc) {
-	return context.WithTimeout(ctx, 3*time.Second)
+	return context.WithTimeout(ctx, quickTimeout)
 }

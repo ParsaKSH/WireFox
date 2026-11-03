@@ -134,9 +134,8 @@ func (a *API) putCoreConfig(w http.ResponseWriter, r *http.Request, _ string) {
 		var apiErr *core.APIError
 		restart = restart || (liveChanged && errors.As(err, &apiErr))
 	}
-	if err := a.Agents.SyncEndpoint(ctx); err != nil {
-		a.log.Warn("updating node configs", "err", err)
-	}
+	// A new tunnel address reaches the nodes once the core runs with it,
+	// see core.RunningTunnel.
 	a.event(ctx, store.Info, "WireFox server config updated")
 	writeJSON(w, http.StatusOK, map[string]bool{"restart_required": restart})
 }
@@ -157,8 +156,24 @@ func (a *API) coreAction(action func(core.Manager, context.Context) error, done 
 	}
 }
 
+// restartCore restarts the core and then gives the nodes the tunnel address
+// it now listens on.
+func (a *API) restartCore(m core.Manager, ctx context.Context) error {
+	if err := m.Restart(ctx); err != nil {
+		return err
+	}
+	if err := a.Tunnel.Restarted(ctx); err != nil {
+		a.log.Warn("reading the core's tunnel listener", "err", err)
+		return nil
+	}
+	if err := a.Agents.SyncEndpoint(ctx); err != nil {
+		a.log.Warn("updating node configs", "err", err)
+	}
+	return nil
+}
+
 func (a *API) coreLogs(w http.ResponseWriter, r *http.Request, _ string) {
-	entries, err := a.Manager.Logs(r.Context(), queryInt(r, "lines", 200, 5000))
+	entries, err := a.Manager.Logs(r.Context(), queryInt(r, "lines", defaultLogLines, maxLogLines))
 	switch {
 	case errors.Is(err, core.ErrNotSupported):
 		writeError(w, http.StatusNotImplemented, err.Error())

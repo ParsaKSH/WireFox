@@ -144,6 +144,11 @@ const (
 	SettingAgentPublicAddr = "agent_public_addr"
 	// Host shown in users' socks5:// addresses.
 	SettingSocksPublicHost = "socks_public_host"
+	// The tunnel listener of the running core, see core.RunningTunnel.
+	SettingCoreTunnel = "core_tunnel"
+
+	// The highest config version handed to a new node or held by a deleted one.
+	settingLastConfigVersion = "last_config_version"
 )
 
 // Setting returns the value stored under key, or "" when there is none.

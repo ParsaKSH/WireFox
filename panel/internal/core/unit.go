@@ -20,7 +20,6 @@ ExecStart=%s run -c %s
 Restart=always
 RestartSec=2
 LimitNOFILE=1048576
-
 ReadWritePaths=%s
 CapabilityBoundingSet=CAP_NET_BIND_SERVICE
 NoNewPrivileges=yes

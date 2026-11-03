@@ -16,10 +16,8 @@ proto:
 		--go-grpc_out=. --go-grpc_opt=module=$(MODULE) \
 		$(PROTO)
 
-# The build replaces internal/web/dist; keep the placeholder go:embed needs.
 frontend:
 	cd frontend && $(NPM) ci && $(NPM) run build
-	touch internal/web/dist/.gitkeep
 
 build: frontend
 	$(GO) build -trimpath -o $(BIN) ./cmd/wirefox-panel

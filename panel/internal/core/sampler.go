@@ -8,8 +8,7 @@ import (
 
 const (
 	SampleInterval = 5 * time.Second
-	// An hour of samples.
-	maxSamples = 720
+	maxSamples     = int(time.Hour / SampleInterval)
 )
 
 // Sample is the core's traffic over one sampling interval.
@@ -79,15 +78,15 @@ func (s *Sampler) add(st *Status, now time.Time) {
 		return
 	}
 	elapsed := now.Sub(prevAt).Seconds()
-	if elapsed <= 0 {
+	// A restarted core loads its saved counters, so the difference to the
+	// last status says nothing about this interval; it starts a new baseline.
+	if elapsed <= 0 || st.UptimeSecs < prev.UptimeSecs {
 		return
 	}
-	// A restarted core counts from zero again.
-	restarted := st.UptimeSecs < prev.UptimeSecs
 	s.samples = append(s.samples, Sample{
 		T:           now.Unix(),
-		UpBps:       float64(counterDelta(prev.BytesUp, st.BytesUp, restarted)) / elapsed,
-		DownBps:     float64(counterDelta(prev.BytesDown, st.BytesDown, restarted)) / elapsed,
+		UpBps:       float64(counterDelta(prev.BytesUp, st.BytesUp)) / elapsed,
+		DownBps:     float64(counterDelta(prev.BytesDown, st.BytesDown)) / elapsed,
 		Connections: st.ActiveConnections,
 	})
 	if len(s.samples) > maxSamples {
@@ -97,15 +96,11 @@ func (s *Sampler) add(st *Status, now time.Time) {
 
 // counterDelta is how much a counter grew. Counters also go down when traffic
 // is reset or a node is deleted; that interval then counts as idle.
-func counterDelta(prev, cur uint64, restarted bool) uint64 {
-	switch {
-	case restarted:
-		return cur
-	case cur < prev:
+func counterDelta(prev, cur uint64) uint64 {
+	if cur < prev {
 		return 0
-	default:
-		return cur - prev
 	}
+	return cur - prev
 }
 
 // History returns the samples of the last hour, oldest first.

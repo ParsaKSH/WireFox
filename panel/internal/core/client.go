@@ -54,21 +54,32 @@ type Status struct {
 	BytesDown         uint64 `json:"bytes_down"`
 }
 
+// Egress is where a node sends its traffic out; empty fields are not set.
+type Egress struct {
+	Interface string `json:"interface"`
+	SourceIP  string `json:"source_ip"`
+}
+
 type Session struct {
 	Remote      string  `json:"remote"`
 	ConnectedAt int64   `json:"connected_at"`
 	RTTMs       float64 `json:"rtt_ms"`
 	IdlePool    int     `json:"idle_pool"`
+	// What the node actually uses, and why it can't use what it was told.
+	ActiveEgress Egress `json:"active_egress"`
+	EgressError  string `json:"egress_error"`
 }
 
 type Node struct {
-	ID        string   `json:"id"`
-	Name      string   `json:"name"`
-	Enabled   bool     `json:"enabled"`
-	CreatedAt int64    `json:"created_at"`
-	Online    bool     `json:"online"`
-	Traffic   Traffic  `json:"traffic"`
-	Session   *Session `json:"session"`
+	ID      string `json:"id"`
+	Name    string `json:"name"`
+	Enabled bool   `json:"enabled"`
+	// Set through the core API; it beats the egress the node has itself.
+	EgressOverride *Egress  `json:"egress_override"`
+	CreatedAt      int64    `json:"created_at"`
+	Online         bool     `json:"online"`
+	Traffic        Traffic  `json:"traffic"`
+	Session        *Session `json:"session"`
 }
 
 // Settings are the core settings that apply without a restart.
@@ -186,7 +197,7 @@ func (c *Client) call(ctx context.Context, method, path string, in, out any) err
 		return err
 	}
 	if status >= 300 {
-		return &APIError{Status: status, Message: ErrorMessage(data)}
+		return &APIError{Status: status, Message: errorMessage(data)}
 	}
 	if out == nil {
 		return nil
@@ -197,8 +208,8 @@ func (c *Client) call(ctx context.Context, method, path string, in, out any) err
 	return nil
 }
 
-// ErrorMessage extracts the message from a core error body.
-func ErrorMessage(body []byte) string {
+// errorMessage extracts the message from a core error body.
+func errorMessage(body []byte) string {
 	var e struct {
 		Error string `json:"error"`
 	}
@@ -254,6 +265,13 @@ func (c *Client) UpdateNode(ctx context.Context, id string, patch NodePatch) (*N
 	return &n, c.call(ctx, http.MethodPatch, "/nodes/"+url.PathEscape(id), patch, &n)
 }
 
+// ClearEgressOverride drops the egress set for the node through the core API,
+// so the egress the panel gives the node applies.
+func (c *Client) ClearEgressOverride(ctx context.Context, id string) (*Node, error) {
+	var n Node
+	return &n, c.call(ctx, http.MethodPatch, "/nodes/"+url.PathEscape(id), map[string]any{"egress": nil}, &n)
+}
+
 func (c *Client) DeleteNode(ctx context.Context, id string) error {
 	return c.call(ctx, http.MethodDelete, "/nodes/"+url.PathEscape(id), nil, nil)
 }
@@ -269,11 +287,6 @@ func (c *Client) RotateToken(ctx context.Context, id string) (string, error) {
 func (c *Client) ResetNodeTraffic(ctx context.Context, id string) (*Node, error) {
 	var n Node
 	return &n, c.call(ctx, http.MethodPost, "/nodes/"+url.PathEscape(id)+"/reset-traffic", nil, &n)
-}
-
-func (c *Client) Settings(ctx context.Context) (*Settings, error) {
-	var s Settings
-	return &s, c.call(ctx, http.MethodGet, "/settings", nil, &s)
 }
 
 func (c *Client) UpdateSettings(ctx context.Context, s Settings) (*Settings, error) {

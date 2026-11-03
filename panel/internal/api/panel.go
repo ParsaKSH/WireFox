@@ -10,6 +10,12 @@ import (
 	"github.com/ParsaKSH/WireFox/panel/internal/store"
 )
 
+const (
+	// Events shown on the overview, and returned by default from /api/events.
+	overviewEvents = 10
+	defaultEvents  = 100
+)
+
 func (a *API) event(ctx context.Context, level store.Level, msg string) {
 	if err := a.Store.AddEvent(context.WithoutCancel(ctx), level, msg); err != nil {
 		a.log.Error("recording event", "err", err)
@@ -78,7 +84,7 @@ func (a *API) overview(w http.ResponseWriter, r *http.Request, _ string) {
 	}
 	resp.Agents.Connected = a.Agents.Connected()
 	resp.History = a.Sampler.History()
-	if resp.Events, err = a.Store.Events(ctx, 10); err != nil {
+	if resp.Events, err = a.Store.Events(ctx, overviewEvents); err != nil {
 		a.internalError(w, r, err)
 		return
 	}
@@ -140,7 +146,7 @@ func (a *API) putSettings(w http.ResponseWriter, r *http.Request, _ string) {
 }
 
 func (a *API) events(w http.ResponseWriter, r *http.Request, _ string) {
-	events, err := a.Store.Events(r.Context(), queryInt(r, "limit", 100, store.MaxEvents))
+	events, err := a.Store.Events(r.Context(), queryInt(r, "limit", defaultEvents, store.MaxEvents))
 	if err != nil {
 		a.internalError(w, r, err)
 		return

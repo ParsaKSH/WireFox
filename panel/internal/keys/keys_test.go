@@ -129,3 +129,20 @@ func TestCertNeedsBothFiles(t *testing.T) {
 		t.Fatal("loaded a certificate without its key")
 	}
 }
+
+func TestCertFinishesInterruptedGeneration(t *testing.T) {
+	dir := t.TempDir()
+	certPath, keyPath := filepath.Join(dir, "panel.crt"), filepath.Join(dir, "panel.key")
+	// A first start that died after writing the key.
+	if err := os.WriteFile(keyPath, []byte("-----BEGIN PRIVATE"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	cert, err := LoadOrCreateCert(certPath, keyPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	again, err := LoadOrCreateCert(certPath, keyPath)
+	if err != nil || again.Fingerprint != cert.Fingerprint {
+		t.Fatalf("reloaded %+v, %v", again, err)
+	}
+}

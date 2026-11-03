@@ -17,13 +17,14 @@ func TestSamplerRates(t *testing.T) {
 	s.add(&Status{UptimeSecs: 105, BytesUp: 6000, BytesDown: 55000, ActiveConnections: 3}, t0.Add(5*time.Second))
 	// Traffic reset: counters drop while the core keeps running.
 	s.add(&Status{UptimeSecs: 110, BytesUp: 100, BytesDown: 100, ActiveConnections: 3}, t0.Add(10*time.Second))
-	// The core restarted and counted 2000 bytes since.
-	s.add(&Status{UptimeSecs: 3, BytesUp: 2000, BytesDown: 0, ActiveConnections: 0}, t0.Add(15*time.Second))
+	// The core restarted with the totals it saved: no sample, a new baseline.
+	s.add(&Status{UptimeSecs: 3, BytesUp: 500_000_000, BytesDown: 0, ActiveConnections: 0}, t0.Add(15*time.Second))
+	s.add(&Status{UptimeSecs: 8, BytesUp: 500_002_000, BytesDown: 0, ActiveConnections: 1}, t0.Add(20*time.Second))
 
 	want := []Sample{
 		{T: 1793600005, UpBps: 1000, DownBps: 10000, Connections: 3},
 		{T: 1793600010, UpBps: 0, DownBps: 0, Connections: 3},
-		{T: 1793600015, UpBps: 400, DownBps: 0, Connections: 0},
+		{T: 1793600020, UpBps: 400, DownBps: 0, Connections: 1},
 	}
 	got := s.History()
 	if len(got) != len(want) {
@@ -43,7 +44,7 @@ func TestSamplerKeepsAnHour(t *testing.T) {
 		s.add(&Status{UptimeSecs: uint64(i)}, t0.Add(time.Duration(i)*SampleInterval))
 	}
 	h := s.History()
-	if len(h) != maxSamples || h[len(h)-1].T != t0.Add((maxSamples+49)*SampleInterval).Unix() {
+	if len(h) != maxSamples || h[len(h)-1].T != t0.Add(time.Duration(maxSamples+49)*SampleInterval).Unix() {
 		t.Fatalf("kept %d samples ending at %d", len(h), h[len(h)-1].T)
 	}
 }
@@ -80,9 +81,8 @@ func TestTunnelAddr(t *testing.T) {
 		{"203.0.113.5:7443", "", "panel.example.com:50051", "203.0.113.5:7443"},
 	}
 	for _, c := range cases {
-		cfg := DefaultConfig("/var/lib/wirefox")
-		cfg.Tunnel.Listen, cfg.Tunnel.PublicAddr = c.listen, c.public
-		if got := cfg.TunnelAddr(c.agentAddr); got != c.want {
+		tunnel := TunnelSection{Listen: c.listen, PublicAddr: c.public}
+		if got := tunnel.Addr(c.agentAddr); got != c.want {
 			t.Errorf("listen %s public %q agent %q: got %s, want %s", c.listen, c.public, c.agentAddr, got, c.want)
 		}
 	}

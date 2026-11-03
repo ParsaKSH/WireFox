@@ -14,10 +14,17 @@ import (
 	"strconv"
 
 	"github.com/pelletier/go-toml/v2"
+
+	"github.com/ParsaKSH/WireFox/panel/internal/atomicfile"
 )
 
 // Balance strategies the core understands.
 var Strategies = []string{"round-robin", "least-ping", "least-load", "random"}
+
+// DefaultTunnelSAN is the name a fresh core config puts in the tunnel
+// certificate and the name nodes verify it against. It matches
+// wirefox_common::proto::DEFAULT_SERVER_NAME.
+const DefaultTunnelSAN = "wirefox"
 
 // ServerConfig mirrors ServerConfig in crates/server/src/config.rs. The core
 // rejects unknown fields, so every name here must match it exactly.
@@ -63,7 +70,7 @@ type APISection struct {
 func DefaultConfig(dataDir string) *ServerConfig {
 	cfg := withDefaults()
 	cfg.DataDir = dataDir
-	cfg.TLS.SANs = []string{"wirefox"}
+	cfg.TLS.SANs = []string{DefaultTunnelSAN}
 	cfg.Tunnel.Listen = "0.0.0.0:7443"
 	cfg.Socks.Listen = []string{"0.0.0.0:1080"}
 	cfg.Socks.TLSListen = []string{"0.0.0.0:1443"}
@@ -153,10 +160,10 @@ func (c *ServerConfig) Validate() error {
 			return err
 		}
 	}
-	if err := CheckTimeout("handshake timeout", c.Socks.HandshakeTimeoutSecs); err != nil {
+	if err := checkTimeout("handshake timeout", c.Socks.HandshakeTimeoutSecs); err != nil {
 		return err
 	}
-	if err := CheckTimeout("connect timeout", c.Socks.ConnectTimeoutSecs); err != nil {
+	if err := checkTimeout("connect timeout", c.Socks.ConnectTimeoutSecs); err != nil {
 		return err
 	}
 	if !slices.Contains(Strategies, c.Socks.Balance) {
@@ -179,27 +186,26 @@ func (c *ServerConfig) Validate() error {
 	return nil
 }
 
-// TunnelAddr is the address nodes dial for the core's tunnel listener:
-// tunnel.public_addr when set, else tunnel.listen, with an unspecified listen
-// IP replaced by the host nodes already use to reach the panel (the host
-// part of agentPublicAddr).
-func (c *ServerConfig) TunnelAddr(agentPublicAddr string) string {
-	if c.Tunnel.PublicAddr != "" {
-		return c.Tunnel.PublicAddr
+// Addr is the address nodes dial for this tunnel listener: public_addr when
+// set, else listen, with an unspecified listen IP replaced by the host nodes
+// already use to reach the panel (the host part of agentPublicAddr).
+func (t TunnelSection) Addr(agentPublicAddr string) string {
+	if t.PublicAddr != "" {
+		return t.PublicAddr
 	}
-	listen, err := netip.ParseAddrPort(c.Tunnel.Listen)
+	listen, err := netip.ParseAddrPort(t.Listen)
 	if err != nil || !listen.Addr().IsUnspecified() {
-		return c.Tunnel.Listen
+		return t.Listen
 	}
 	host, _, err := net.SplitHostPort(agentPublicAddr)
 	if err != nil || host == "" {
-		return c.Tunnel.Listen
+		return t.Listen
 	}
 	return net.JoinHostPort(host, strconv.Itoa(int(listen.Port())))
 }
 
-// CheckTimeout applies the core's limits for its timeouts.
-func CheckTimeout(name string, secs uint64) error {
+// checkTimeout applies the core's limits for its timeouts.
+func checkTimeout(name string, secs uint64) error {
 	if secs < 1 || secs > 600 {
 		return fmt.Errorf("%s must be between 1 and 600 seconds", name)
 	}
@@ -221,34 +227,5 @@ func (c *ServerConfig) Save(path string) error {
 	if err != nil {
 		return err
 	}
-	return WriteFileAtomic(path, data, 0o600)
-}
-
-// WriteFileAtomic replaces path with data so readers never see a partial file.
-func WriteFileAtomic(path string, data []byte, perm os.FileMode) error {
-	dir := filepath.Dir(path)
-	if err := os.MkdirAll(dir, 0o755); err != nil {
-		return err
-	}
-	tmp, err := os.CreateTemp(dir, "."+filepath.Base(path)+".*")
-	if err != nil {
-		return err
-	}
-	defer os.Remove(tmp.Name())
-	if err := tmp.Chmod(perm); err != nil {
-		tmp.Close()
-		return err
-	}
-	if _, err := tmp.Write(data); err != nil {
-		tmp.Close()
-		return err
-	}
-	if err := tmp.Sync(); err != nil {
-		tmp.Close()
-		return err
-	}
-	if err := tmp.Close(); err != nil {
-		return err
-	}
-	return os.Rename(tmp.Name(), path)
+	return atomicfile.Write(path, data, 0o600)
 }

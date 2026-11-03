@@ -120,6 +120,7 @@ func TestNodes(t *testing.T) {
 	if err := s.CreateNode(ctx, n); err != nil {
 		t.Fatal(err)
 	}
+	version := n.ConfigVersion
 	if err := s.CreateNode(ctx, NewNode("b")); !errors.Is(err, ErrExists) {
 		t.Fatalf("duplicate id: %v", err)
 	}
@@ -150,7 +151,7 @@ func TestNodes(t *testing.T) {
 		n.ConfigVersion++
 		return nil
 	})
-	if err != nil || updated.ConfigVersion != 2 {
+	if err != nil || updated.ConfigVersion != version+1 {
 		t.Fatalf("update: %+v, %v", updated, err)
 	}
 	failed := errors.New("nope")
@@ -173,7 +174,7 @@ func TestNodes(t *testing.T) {
 		t.Fatal(err)
 	}
 	if got.PoolSize != DefaultPoolSize || !got.AllowLocal || got.Egress.SourceIP != "192.0.2.1" ||
-		got.ConfigVersion != 3 || got.LastSeen != 42 || got.Agent.Interfaces[0].Name != "eth1" {
+		got.ConfigVersion != version+2 || got.LastSeen != 42 || got.Agent.Interfaces[0].Name != "eth1" {
 		t.Fatalf("stored node %+v", got)
 	}
 
@@ -186,5 +187,45 @@ func TestNodes(t *testing.T) {
 	}
 	if err := s.DeleteNode(ctx, "b"); !errors.Is(err, ErrNotFound) {
 		t.Fatalf("second delete: %v", err)
+	}
+}
+
+func TestConfigVersionsOnlyGrow(t *testing.T) {
+	s, ctx := open(t), context.Background()
+	before := uint64(time.Now().UnixMilli())
+	a := NewNode("a")
+	if err := s.CreateNode(ctx, a); err != nil {
+		t.Fatal(err)
+	}
+	if a.ConfigVersion < before {
+		t.Fatalf("first version %d is below the clock (%d)", a.ConfigVersion, before)
+	}
+	// Far ahead of the clock, as after many changes.
+	bumped, err := s.UpdateNode(ctx, "a", func(n *Node) error {
+		n.ConfigVersion += 1 << 50
+		return nil
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	b := NewNode("b")
+	if err := s.CreateNode(ctx, b); err != nil {
+		t.Fatal(err)
+	}
+	if b.ConfigVersion != bumped.ConfigVersion+1 {
+		t.Fatalf("new node got %d next to %d", b.ConfigVersion, bumped.ConfigVersion)
+	}
+	// Deleted nodes don't take their versions with them.
+	for _, id := range []string{"a", "b"} {
+		if err := s.DeleteNode(ctx, id); err != nil {
+			t.Fatal(err)
+		}
+	}
+	again := NewNode("a")
+	if err := s.CreateNode(ctx, again); err != nil {
+		t.Fatal(err)
+	}
+	if again.ConfigVersion != b.ConfigVersion+1 {
+		t.Fatalf("recreated node got %d after %d", again.ConfigVersion, b.ConfigVersion)
 	}
 }
