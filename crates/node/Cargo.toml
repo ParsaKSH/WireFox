@@ -25,7 +25,7 @@ rand.workspace = true
 tracing-subscriber.workspace = true
 mimalloc = { workspace = true, optional = true }
 if-addrs = "0.15"
-base64 = "0.22"
+base64 = "0.23"
 hyper-util = { version = "0.1", features = ["tokio"] }
 prost = "0.14"
 tokio-stream = { version = "0.1", default-features = false }
