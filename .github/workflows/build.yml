@@ -121,7 +121,7 @@ jobs:
           node-version: 22
           cache: npm
           cache-dependency-path: panel/frontend/package-lock.json
-      - uses: actions/setup-go@v6
+      - uses: actions/setup-go@v7
         with:
           go-version-file: panel/go.mod
           cache-dependency-path: panel/go.sum
